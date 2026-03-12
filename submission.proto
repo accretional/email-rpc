@@ -1,0 +1,100 @@
+syntax = "proto3";
+package submission;
+
+import "mail.proto";
+import "smtp.proto";
+
+// ═══════════════════════════════════════════
+//  Submission policy — what the MSA enforces
+// ═══════════════════════════════════════════
+//
+//  The MSA is the trust boundary between the user and the mail system.
+//  It MUST authenticate the sender (unlike port 25 relay).
+//  It MAY rewrite headers, enforce size limits, and add missing fields.
+
+message SubmissionPolicy {
+  bool   require_auth       = 1;  // always true per RFC 6409
+  bool   require_tls        = 2;  // STARTTLS or implicit TLS (port 465)
+  uint64 max_message_size   = 3;  // bytes
+  uint32 max_recipients     = 4;  // per message
+  uint32 rate_limit_per_hour = 5;
+
+  // Sender identity enforcement:
+  // The MSA checks that the From: header matches the authenticated identity.
+  // This prevents authenticated users from spoofing arbitrary senders.
+  SenderPolicy sender_policy = 6;
+}
+
+message SenderPolicy {
+  Mode mode = 1;
+
+  enum Mode {
+    // From: must exactly match the authenticated identity
+    STRICT = 0;
+    // From: must be within the authenticated domain (user can set display name, alias)
+    DOMAIN = 1;
+    // No enforcement (unusual, but some relays allow delegated sending)
+    PERMISSIVE = 2;
+  }
+
+  // Additional addresses this authenticated user is allowed to send as
+  repeated string permitted_senders = 2;
+}
+
+// ═══════════════════════════════════════════
+//  Header fixup — what the MSA modifies
+// ═══════════════════════════════════════════
+//
+//  RFC 6409 §8: the MSA is expected to complete and repair messages.
+//  This is where Date, Message-ID, and MIME structure get filled in
+//  if the client didn't provide them.
+
+message HeaderFixup {
+  bool added_date       = 1;  // Date: was missing
+  bool added_message_id = 2;  // Message-ID: was missing or rewritten
+  bool added_mime       = 3;  // MIME-Version: was missing
+  bool rewritten_from   = 4;  // From: was adjusted to match auth identity
+  bool added_sender     = 5;  // Sender: added when From: has multiple addresses
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service SubmissionService {
+  // Authenticate the sending user (required before Submit)
+  rpc Authenticate(smtp.AuthCredentials) returns (AuthResponse);
+
+  // Submit a message for delivery
+  // Unlike SmtpService.Deliver, this:
+  //   1. Enforces sender identity (From: matches auth)
+  //   2. Applies rate limits and size policy
+  //   3. Performs header fixup (adds Date, Message-ID, etc.)
+  //   4. Hands off to the MTA (SmtpService) for actual relay
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+
+  // Query the submission policy (clients can preflight limits)
+  rpc GetPolicy(PolicyRequest) returns (SubmissionPolicy);
+}
+
+message AuthResponse {
+  bool   success  = 1;
+  string identity = 2;  // the verified sender identity
+  SubmissionPolicy policy = 3;  // applicable limits for this user
+}
+
+message SubmitRequest {
+  mail.Message message = 1;
+
+  // Optional: client can supply explicit envelope recipients.
+  // If omitted, MSA derives them from To/Cc/Bcc.
+  repeated string explicit_rcpt_to = 2;
+}
+
+message SubmitResponse {
+  string                         message_id = 1;  // may differ from client's if rewritten
+  HeaderFixup                    fixups     = 2;
+  repeated smtp.TransactionResult results   = 3;  // per-recipient delivery status
+}
+
+message PolicyRequest {}
