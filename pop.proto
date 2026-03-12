@@ -1,0 +1,82 @@
+syntax = "proto3";
+package pop;
+
+// ═══════════════════════════════════════════
+//  Message listing
+// ═══════════════════════════════════════════
+
+message MessageInfo {
+  uint32 id   = 1;  // message number (1-based, ephemeral per session)
+  uint32 size = 2;  // octets
+  string uidl = 3;  // unique-id listing: stable across sessions (client-side state key)
+}
+
+// ═══════════════════════════════════════════
+//  Service — the complete POP3 lifecycle
+// ═══════════════════════════════════════════
+//
+//  The POP model is transactional:
+//    Authenticate → List/Retrieve/Delete → Quit (commits) or Reset (aborts)
+//  Deletions only take effect on Quit.
+
+service PopService {
+  rpc Authenticate(AuthRequest) returns (AuthResponse);
+
+  // List all messages in the maildrop
+  rpc List(ListRequest) returns (ListResponse);
+
+  // Download a complete message
+  rpc Retrieve(RetrieveRequest) returns (RetrieveResponse);
+
+  // Peek: headers + first N lines of body (TOP command)
+  rpc Top(TopRequest) returns (TopResponse);
+
+  // Mark for deletion (applied on Quit)
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // Commit deletions and disconnect
+  rpc Quit(QuitRequest) returns (QuitResponse);
+
+  // Abort: unmark all deletions
+  rpc Reset(ResetRequest) returns (ResetResponse);
+}
+
+message AuthRequest {
+  string host = 1;
+  uint32 port = 2;  // 995 (TLS) or 110 (STARTTLS)
+  oneof credentials {
+    PlainCredentials plain = 3;
+    ApopCredentials  apop  = 4;  // challenge-response (avoids cleartext password)
+  }
+}
+
+message PlainCredentials { string username = 1; string password = 2; }
+
+message ApopCredentials {
+  string username = 1;
+  string digest   = 2;  // MD5(server_timestamp + password)
+}
+
+message AuthResponse {
+  bool   success       = 1;
+  uint32 message_count = 2;
+  uint32 maildrop_size = 3;  // total octets
+}
+
+message ListRequest     {}
+message ListResponse    { repeated MessageInfo messages = 1; }
+
+message RetrieveRequest  { uint32 id = 1; }
+message RetrieveResponse { bytes message = 1; }  // complete RFC 5322 message
+
+message TopRequest       { uint32 id = 1; uint32 lines = 2; }
+message TopResponse      { bytes data = 1; }
+
+message DeleteRequest    { uint32 id = 1; }
+message DeleteResponse   { bool success = 1; }
+
+message QuitRequest      {}
+message QuitResponse     { uint32 deleted_count = 1; }
+
+message ResetRequest     {}
+message ResetResponse    { uint32 restored_count = 1; }
