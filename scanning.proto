@@ -1,0 +1,195 @@
+syntax = "proto3";
+package scanning;
+
+import "google/protobuf/timestamp.proto";
+
+// ═══════════════════════════════════════════
+//  Scan result — the aggregate verdict
+// ═══════════════════════════════════════════
+//
+//  This is what gets stamped into headers like:
+//    X-Spam-Status: Yes, score=8.3 required=5.0 tests=BAYES_99,HTML_IMAGE_ONLY,...
+//    X-Spam-Score: 8.3
+
+message ScanResult {
+  Verdict verdict       = 1;
+  double  score         = 2;   // composite score (higher = more likely spam)
+  double  threshold     = 3;   // score at which message is considered spam
+  repeated RuleMatch rules = 4;  // which rules fired
+
+  // ── Sub-scanner results ──
+  SpamAnalysis    spam    = 5;
+  PhishAnalysis   phish   = 6;
+  MalwareAnalysis malware = 7;
+
+  // ── Headers to add ──
+  repeated HeaderAddition headers = 8;
+
+  enum Verdict {
+    CLEAN      = 0;
+    SPAM       = 1;
+    PROBABLE_SPAM = 2;  // above soft threshold but below hard
+    PHISH      = 3;
+    MALWARE    = 4;
+    SUSPECT    = 5;     // suspicious but not conclusive
+  }
+}
+
+message RuleMatch {
+  string name        = 1;  // "BAYES_99", "HTML_IMAGE_ONLY", "URIBL_BLACK"
+  double score       = 2;  // this rule's contribution to total score
+  string description = 3;
+  string area        = 4;  // "header", "body", "uri", "meta", "rawbody"
+}
+
+message HeaderAddition {
+  string name  = 1;  // "X-Spam-Status", "X-Spam-Score", "X-Spam-Flag"
+  string value = 2;
+}
+
+// ═══════════════════════════════════════════
+//  Spam analysis
+// ═══════════════════════════════════════════
+
+message SpamAnalysis {
+  double bayesian_score = 1;  // 0.0 (ham) to 1.0 (spam)
+
+  // Header analysis
+  repeated HeaderAnomaly header_anomalies = 2;
+
+  // Body analysis
+  double html_text_ratio      = 3;  // high ratio = suspicious
+  bool   invisible_text       = 4;  // text colored same as background
+  bool   image_only           = 5;  // HTML body with only images, no text
+  uint32 url_count            = 6;
+  uint32 shortener_url_count  = 7;  // bit.ly, t.co, etc.
+
+  // URI blocklist hits
+  repeated UriBlHit uri_hits = 8;
+}
+
+message HeaderAnomaly {
+  string header      = 1;  // which header
+  string anomaly     = 2;  // "missing_date", "forged_received", "suspicious_mailer"
+  double score       = 3;
+}
+
+message UriBlHit {
+  string uri       = 1;
+  string blocklist = 2;  // "URIBL_BLACK", "SURBL_MULTI"
+  string domain    = 3;  // the domain that matched
+}
+
+// ═══════════════════════════════════════════
+//  Phishing analysis
+// ═══════════════════════════════════════════
+
+message PhishAnalysis {
+  bool   is_phish                = 1;
+  double confidence              = 2;
+  repeated PhishIndicator indicators = 3;
+}
+
+message PhishIndicator {
+  Type   type        = 1;
+  string detail      = 2;
+  double score       = 3;
+
+  enum Type {
+    DISPLAY_URL_MISMATCH = 0;  // link text says "paypal.com", href goes elsewhere
+    BRAND_IMPERSONATION  = 1;  // from-domain looks like a known brand
+    HOMOGLYPH_DOMAIN     = 2;  // pаypal.com (cyrillic 'а')
+    SUSPICIOUS_FORM      = 3;  // HTML form with action pointing to external URL
+    CREDENTIAL_HARVESTING = 4;  // password field in email HTML
+    URGENCY_LANGUAGE     = 5;  // "your account will be suspended"
+    CERTIFICATE_MISMATCH = 6;  // linked site's cert doesn't match displayed domain
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Malware analysis
+// ═══════════════════════════════════════════
+
+message MalwareAnalysis {
+  bool   is_malicious            = 1;
+  repeated AttachmentScan attachments = 2;
+}
+
+message AttachmentScan {
+  string filename      = 1;
+  string content_type  = 2;
+  uint64 size          = 3;
+  string sha256        = 4;
+  bool   is_malicious  = 5;
+  string malware_name  = 6;  // "Trojan.GenericKD.12345" if detected
+
+  // File type analysis
+  string detected_type = 7;  // actual type vs declared type
+  bool   type_mismatch = 8;  // .pdf that's actually .exe
+  bool   password_protected = 9;  // encrypted archive (can't scan)
+  bool   contains_macros = 10;  // Office macros present
+
+  // Nested archive contents
+  repeated AttachmentScan nested = 11;  // files within archives
+
+  repeated string scanner_names = 12;  // which AV engines flagged it
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+//
+//  In a milter deployment, the MTA calls this service
+//  at end-of-message to get the verdict and headers.
+
+service ScanningService {
+  // Full scan: spam + phish + malware
+  rpc Scan(ScanRequest) returns (ScanResult);
+
+  // Individual sub-scanners (for selective/staged scanning)
+  rpc CheckSpam(ScanRequest) returns (SpamAnalysis);
+  rpc CheckPhish(ScanRequest) returns (PhishAnalysis);
+  rpc CheckMalware(ScanRequest) returns (MalwareAnalysis);
+
+  // Learn: feed known-good/known-bad messages to improve Bayesian filter
+  rpc Train(TrainRequest) returns (TrainResponse);
+
+  // Check a specific URL (useful for link-click-time scanning)
+  rpc CheckUrl(UrlCheckRequest) returns (UrlCheckResponse);
+}
+
+message ScanRequest {
+  bytes  raw_message = 1;
+
+  // Context from the SMTP session (helps with scoring)
+  string source_ip     = 2;
+  string helo_domain   = 3;
+  string envelope_from = 4;
+  string auth_user     = 5;  // if authenticated (submission)
+  bool   authenticated = 6;
+
+  // Prior authentication results (informs scoring)
+  string authentication_results = 7;
+}
+
+message TrainRequest {
+  bytes message     = 1;
+  bool  is_spam     = 2;  // true = spam, false = ham
+  string trained_by = 3;  // "user_report", "admin", "feedback_loop"
+}
+
+message TrainResponse {
+  bool success = 1;
+}
+
+message UrlCheckRequest {
+  string url = 1;
+}
+
+message UrlCheckResponse {
+  bool   safe        = 1;
+  string category    = 2;  // "phishing", "malware", "spam", "safe"
+  double risk_score  = 3;
+  string final_url   = 4;  // after following redirects
+  uint32 redirect_count = 5;
+}
