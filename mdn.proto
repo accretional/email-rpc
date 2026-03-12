@@ -1,0 +1,119 @@
+syntax = "proto3";
+package mdn;
+
+import "mail.proto";
+import "google/protobuf/timestamp.proto";
+
+// ═══════════════════════════════════════════
+//  Request (header on the original message)
+// ═══════════════════════════════════════════
+
+// The sender requests a notification by including this header.
+// The recipient's MUA decides whether to honor it — it's purely advisory.
+message DispositionNotificationRequest {
+  string report_to = 1;  // value of Disposition-Notification-To header
+  // Typically matches From: but doesn't have to.
+  // If it differs from From:, most MUAs will silently ignore it
+  // (anti-spam measure).
+}
+
+// ═══════════════════════════════════════════
+//  The notification itself (a message sent back)
+// ═══════════════════════════════════════════
+//
+//  An MDN is a multipart/report MIME message with:
+//    part 1: human-readable explanation
+//    part 2: machine-readable disposition (message/disposition-notification)
+//    part 3 (optional): the original message headers
+
+message Notification {
+  // ── Required fields ──
+  string               reporting_ua   = 1;  // "Thunderbird/115.0"
+  string               original_message_id = 2;
+  string               final_recipient = 3;  // who processed the message
+  Disposition          disposition    = 4;
+
+  // ── Optional fields ──
+  string               original_recipient = 5;  // if different (forwarding)
+  google.protobuf.Timestamp date = 6;
+
+  // Gateway: if the MDN was generated at a protocol boundary (e.g., fax→email)
+  string               gateway = 7;
+}
+
+message Disposition {
+  ActionMode   action_mode   = 1;
+  SendingMode  sending_mode  = 2;
+  Type         type          = 3;
+  repeated Modifier modifiers = 4;
+
+  enum ActionMode {
+    MANUAL    = 0;  // user explicitly triggered (clicked "send receipt")
+    AUTOMATIC = 1;  // MUA auto-generated (configured to always respond)
+  }
+
+  enum SendingMode {
+    SENT_MANUALLY     = 0;  // user chose to send the notification
+    SENT_AUTOMATICALLY = 1;  // MUA sent without user interaction
+  }
+
+  enum Type {
+    DISPLAYED = 0;  // message was displayed to the user
+    DELETED   = 1;  // deleted without being displayed
+    DISPATCHED = 2; // dispatched to another system (print, fax, etc.)
+    PROCESSED = 3;  // processed by automated system (not displayed to human)
+    DENIED    = 4;  // recipient explicitly refuses to send MDN
+    FAILED    = 5;  // MDN generation itself failed
+  }
+
+  enum Modifier {
+    ERROR     = 0;  // an error occurred
+    WARNING   = 1;
+    SUPERSEDED = 2; // a later action supersedes this one
+    EXPIRED   = 3;  // notification delayed beyond useful window
+    MAILBOX_TERMINATED = 4;  // recipient's mailbox no longer exists
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service MdnService {
+  // Check if a message requests a disposition notification
+  rpc Check(CheckRequest) returns (CheckResponse);
+
+  // Generate the MDN message (multipart/report) for sending
+  rpc Generate(GenerateRequest) returns (GenerateResponse);
+
+  // Parse an incoming MDN
+  rpc Parse(ParseRequest) returns (Notification);
+}
+
+message CheckRequest {
+  bytes message = 1;  // raw RFC 5322 message
+}
+
+message CheckResponse {
+  bool   requested    = 1;
+  string report_to    = 2;  // the address requesting the notification
+  bool   from_matches = 3;  // does report_to match From:? (trust signal)
+}
+
+message GenerateRequest {
+  string         original_message_id = 1;
+  string         final_recipient     = 2;
+  Disposition    disposition         = 3;
+  string         reporting_ua        = 4;
+  bytes          original_headers    = 5;  // optional: to include as third MIME part
+  string         human_readable      = 6;  // part 1 text (optional, will auto-generate)
+}
+
+message GenerateResponse {
+  mail.Message mdn_message = 1;  // the notification as a sendable message
+  bytes        raw         = 2;  // RFC 5322 encoded
+}
+
+message ParseRequest {
+  bytes message = 1;  // the received multipart/report message
+}
