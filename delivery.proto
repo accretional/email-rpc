@@ -2,8 +2,12 @@ syntax = "proto3";
 package delivery;
 
 import "mail.proto";
+import "mime.proto";
 import "smtp.proto";
 import "submission.proto";
+import "lmtp.proto";
+import "queue.proto";
+import "srs.proto";
 import "dns/mx.proto";
 import "dns/spf.proto";
 import "dns/dkim.proto";
@@ -11,64 +15,153 @@ import "dns/dmarc.proto";
 import "dns/arc.proto";
 import "dns/tls_policy.proto";
 import "dns/bimi.proto";
+import "dns/dnsbl.proto";
+import "scanning.proto";
+import "trace.proto";
 import "reputation.proto";
 import "bounce.proto";
+import "list.proto";
+import "eai.proto";
 
 // ═══════════════════════════════════════════
 //  Complete outbound pipeline
 // ═══════════════════════════════════════════
 //
-//  mail.Message
-//    → SubmissionService.Submit       (auth sender, fixup headers)
-//    → MimeCodec.Encode               (message → RFC 5322 bytes)
-//    → ListService.GenerateHeaders     (add List-* headers if bulk)
-//    → DkimService.Sign                (attach DKIM signature)
-//    → ReputationService.CheckSuppression (skip suppressed recipients)
-//    per recipient domain:
-//      → MxResolver.Resolve            (find mail server)
-//      → TlsPolicyService.Resolve      (determine TLS requirements)
-//      → SmtpService.Deliver           (transmit with appropriate TLS)
-//    → BounceService.Process           (handle any failures)
+//  Client:
+//    mail.Message
+//      → EaiService.ParseAddress          (normalize international addresses)
+//      → SubmissionService.Submit          (auth sender, fixup headers, rate limit)
+//      → MimeCodec.Encode                  (message → RFC 5322 bytes)
+//      → ListService.GenerateHeaders       (add List-* headers if bulk)
+//      → DkimService.Sign                  (attach DKIM signature)
+//      → TraceService.Stamp                (add Received: header)
+//      → ReputationService.CheckSuppression (skip suppressed recipients)
+//
+//  Per recipient domain:
+//      → MxResolver.Resolve                (find mail server)
+//      → DnsblService.CheckMulti           (is the MX itself blocklisted?)
+//      → TlsPolicyService.Resolve          (determine TLS requirements)
+//      → QueueService.Enqueue              (enter the queue)
+//
+//  Queue runner:
+//      → SmtpService.Deliver               (transmit with appropriate TLS)
+//      on 4xx → re-queue with backoff
+//      on 5xx → BounceService.Process → generate DSN
+//
+//  Forwarding (if applicable):
+//      → SrsService.Rewrite                (fix envelope sender for SPF)
+//      → ArcService.Seal                   (preserve auth chain)
+//      → SmtpService.Deliver
 
-message OutboundDelivery {
-  string                           recipient_domain = 1;
-  dns.mx.ResolvedRoute             route            = 2;
-  dns.tls_policy.ResolvedTlsPolicy tls_policy       = 3;
-  repeated smtp.TransactionResult  results          = 4;
-  smtp.Session                     session          = 5;
-  submission.HeaderFixup           fixups           = 6;
+message OutboundPipeline {
+  // What happened at each stage
+  submission.HeaderFixup              fixups       = 1;
+  eai.InternationalAddress            sender_eai   = 2;
+
+  // Per-domain delivery attempts
+  repeated DomainDelivery             deliveries   = 3;
+
+  // Skipped recipients
+  repeated SuppressedRecipient        suppressed   = 4;
+
+  // Queue tracking
+  string                              queue_id     = 5;
+}
+
+message DomainDelivery {
+  string                               recipient_domain = 1;
+  dns.mx.ResolvedRoute                 route            = 2;
+  dns.tls_policy.ResolvedTlsPolicy     tls_policy       = 3;
+  dns.dnsbl.MultiZoneResult            mx_blocklist     = 4;
+  repeated smtp.TransactionResult      results          = 5;
+  smtp.Session                         session          = 6;
+
+  // If this was a forwarding hop
+  srs.SrsAddress                       srs_rewrite      = 7;
+  dns.arc.ArcSet                       arc_seal         = 8;
+}
+
+message SuppressedRecipient {
+  string address = 1;
+  reputation.SuppressionEntry.Reason reason = 2;
 }
 
 // ═══════════════════════════════════════════
-//  Complete inbound authentication pipeline
+//  Complete inbound pipeline
 // ═══════════════════════════════════════════
 //
-//  raw message + connection metadata
-//    → SpfService.Check                (is this IP authorized?)
-//    → DkimService.Verify              (was this message tampered with?)
-//    → ArcService.Validate             (is the forwarding chain intact?)
-//    → DmarcService.Evaluate           (do SPF/DKIM align with From:?)
-//    → BimiService.Evaluate            (does the sender have a verified logo?)
-//    → SieveService: execute active script
-//    → MimeCodec.Decode                (bytes → mail.Message)
-//    → CryptoService: decrypt if S/MIME or PGP/MIME
+//  SMTP reception:
+//    → TraceService.Stamp                  (add Received: header)
+//    → DnsblService.CheckMulti             (is the source IP blocklisted?)
+//
+//  Milter chain (streamed during SMTP transaction):
+//    → MilterService.Filter                (connect, helo, mail_from, rcpt_to, headers, body, eom)
+//
+//  Post-DATA authentication:
+//    → SpfService.Check                    (is this IP authorized?)
+//    → DkimService.Verify                  (was this message tampered with?)
+//    → ArcService.Validate                 (is the forwarding chain intact?)
+//    → DmarcService.Evaluate               (do SPF/DKIM align with From:?)
+//
+//  Content scanning:
+//    → ScanningService.Scan                (spam + phish + malware)
+//
+//  Post-scan:
+//    → BimiService.Evaluate                (does the sender have a verified logo?)
+//    → TraceService.Stamp                  (add Authentication-Results header)
+//
+//  Local delivery:
+//    → EaiService.Downgrade                (if recipient's store doesn't support UTF-8)
+//    → LmtpService.Deliver                 (write to mailbox, execute Sieve)
+//
+//  Retrieval (later):
+//    → ImapService.Fetch / JmapService.Execute / PopService.Retrieve
+//    → MimeCodec.Decode
+//    → CryptoService.Decrypt               (if S/MIME or PGP/MIME)
+//    → mail.Message
 
-message InboundAuthResult {
-  dns.spf.CheckResult              spf   = 1;
-  repeated dns.dkim.VerifyResult   dkim  = 2;
-  dns.arc.ChainValidationResult    arc   = 3;
-  dns.dmarc.EvaluationResult       dmarc = 4;
-  dns.bimi.BimiResult              bimi  = 5;
+message InboundPipeline {
+  // Connection-time checks
+  dns.dnsbl.MultiZoneResult            source_blocklist  = 1;
+  trace.ReceivedHop                    received_hop      = 2;
 
-  // RFC 8601: the Authentication-Results header to stamp
-  string authentication_results_header = 6;
+  // Authentication chain
+  dns.spf.CheckResult                  spf               = 3;
+  repeated dns.dkim.VerifyResult       dkim              = 4;
+  dns.arc.ChainValidationResult        arc               = 5;
+  dns.dmarc.EvaluationResult           dmarc             = 6;
 
-  Disposition disposition = 7;
+  // Content scanning
+  scanning.ScanResult                  scan              = 7;
+
+  // Brand indicators
+  dns.bimi.BimiResult                  bimi              = 8;
+
+  // Auth header stamped on the message
+  trace.AuthenticationResultsHeader    auth_header       = 9;
+
+  // Milter modifications applied
+  repeated MilterModification          milter_mods       = 10;
+
+  // Final disposition
+  Disposition                          disposition       = 11;
+
+  // Local delivery results (per recipient)
+  repeated lmtp.RecipientDeliveryResult delivery_results = 12;
+  repeated lmtp.DeliveryMetadata       delivery_metadata = 13;
+
   enum Disposition {
     ACCEPT     = 0;
-    QUARANTINE = 1;
-    REJECT     = 2;
+    QUARANTINE = 1;  // delivered but marked as spam/suspect
+    REJECT     = 2;  // rejected at SMTP level
+    DISCARD    = 3;  // silently dropped (milter or policy)
+    DEFER      = 4;  // temporary rejection (greylisting, etc.)
   }
+}
+
+message MilterModification {
+  string milter_name = 1;  // which milter made this change
+  milter.MilterAction action = 2;
 }
 
 // ═══════════════════════════════════════════
@@ -76,14 +169,17 @@ message InboundAuthResult {
 // ═══════════════════════════════════════════
 
 service DeliveryService {
-  rpc Send(OutboundRequest) returns (OutboundResponse);
-  rpc Authenticate(InboundRequest) returns (InboundAuthResult);
+  // Outbound: full pipeline from mail.Message to remote delivery
+  rpc Send(OutboundRequest) returns (OutboundPipeline);
+
+  // Inbound: full pipeline from SMTP reception to local delivery
+  rpc Receive(InboundRequest) returns (InboundPipeline);
 }
 
 message OutboundRequest {
   mail.Message message = 1;
 
-  // Signing
+  // Signing config
   string signing_domain   = 2;
   string dkim_selector    = 3;
   bytes  dkim_private_key = 4;
@@ -93,11 +189,9 @@ message OutboundRequest {
 
   // List headers (if this is a bulk/list send)
   list.ListHeaders list_headers = 6;
-}
 
-message OutboundResponse {
-  repeated OutboundDelivery deliveries = 1;
-  repeated string           suppressed = 2;  // addresses skipped due to suppression
+  // Queue policy override
+  queue.RetryPolicy retry_policy = 7;
 }
 
 message InboundRequest {
@@ -105,4 +199,8 @@ message InboundRequest {
   string source_ip     = 2;
   string helo_domain   = 3;
   string envelope_from = 4;
+  repeated string envelope_to = 5;
+
+  // Milter chain to apply
+  repeated string milter_endpoints = 6;  // addresses of milter services
 }
