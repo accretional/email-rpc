@@ -1,0 +1,118 @@
+syntax = "proto3";
+package mail;
+
+import "google/protobuf/timestamp.proto";
+
+// ═══════════════════════════════════════════
+//  Core types
+// ═══════════════════════════════════════════
+
+// RFC 5322 addr-spec with optional display name
+message Address {
+  string local  = 1;        // "alice" in alice@example.com
+  string domain = 2;        // "example.com"
+  string display_name = 3;  // "Alice Smith" — the human part
+}
+
+message Message {
+  string message_id = 1;          // RFC 5322 Message-ID (globally unique)
+
+  // ── Addressing ──
+  Address         from     = 2;
+  Address         sender   = 3;   // when sending on-behalf-of (distinct from `from`)
+  Address         reply_to = 4;
+  repeated Address to      = 5;
+  repeated Address cc      = 6;
+  repeated Address bcc     = 7;   // stripped before delivery, but part of composition
+
+  // ── Content ──
+  string             subject     = 8;
+  Body               body        = 9;
+  repeated Attachment attachments = 10;
+
+  // ── Threading ──
+  //    This is the essential data model for threads — Message-ID references.
+  //    Client-side thread reconstruction uses these, not server-side grouping.
+  string          in_reply_to = 11;  // Message-ID of the direct parent
+  repeated string references  = 12;  // Ordered chain of ancestor Message-IDs
+
+  // ── Metadata ──
+  google.protobuf.Timestamp date = 13;
+  repeated Header headers        = 14; // Escape hatch: arbitrary RFC 5322 headers
+}
+
+message Body {
+  string text = 1;  // text/plain — always present
+  string html = 2;  // text/html — optional rich alternative
+  // The MIME multipart/alternative negotiation is an implementation detail.
+  // Clients provide whichever variants they have. The codec layer handles it.
+}
+
+message Attachment {
+  string filename    = 1;
+  string content_type = 2;  // MIME type: "application/pdf", "image/png", etc.
+  bytes  content     = 3;
+  bool   inline      = 4;   // Content-Disposition: inline (embedded in body)
+  string content_id  = 5;   // CID for inline refs from HTML: <img src="cid:...">
+}
+
+message Header {
+  string name  = 1;
+  string value = 2;
+}
+
+// ═══════════════════════════════════════════
+//  Service — the client-facing API
+// ═══════════════════════════════════════════
+
+service MailService {
+  // Compose and send. Implementation handles MIME encoding, DKIM, MX, SMTP.
+  rpc Send(SendRequest) returns (SendResponse);
+
+  // Retrieve messages. Backend picks IMAP/POP/whatever.
+  rpc Fetch(FetchRequest) returns (stream Message);
+
+  // Push: long-lived stream of new message notifications
+  rpc Watch(WatchRequest) returns (stream Notification);
+}
+
+message SendRequest {
+  Message message = 1;
+}
+
+message SendResponse {
+  string message_id = 1;
+  repeated RecipientStatus recipients = 2;
+}
+
+message RecipientStatus {
+  Address recipient = 1;
+  Status  status    = 2;
+  string  diagnostic = 3;  // human-readable if failed
+
+  enum Status {
+    QUEUED    = 0;  // accepted, delivery in progress
+    DELIVERED = 1;  // confirmed by remote MTA
+    BOUNCED   = 2;  // permanent failure
+    DEFERRED  = 3;  // temporary failure, will retry
+  }
+}
+
+message FetchRequest {
+  // "INBOX" is the only mailbox the RFC mandates exists. This is the
+  // protocol-essential concept of a mailbox, not a UX "folder."
+  string mailbox = 1;
+  uint32 limit   = 2;
+  string cursor  = 3;  // opaque pagination token
+}
+
+message WatchRequest {
+  string mailbox = 1;
+}
+
+message Notification {
+  string  message_id = 1;
+  Address from       = 2;
+  string  subject    = 3;
+  google.protobuf.Timestamp date = 4;
+}
