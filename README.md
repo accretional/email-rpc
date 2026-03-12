@@ -3,7 +3,9 @@ What if we could re-implement the entire modern world of email as a single coher
 
 Also it seems like it would be cool to have the robots email each other? Or to be able to send each other messages on the cli? Or if you could just apt-get install and entire e2e email tool?
 
-## The Complete File Map
+# Protocols and Interfaces
+
+```
 mail.proto                  ← user-facing model (what you send/receive)
 mime.proto                  ← wire format codec (message ↔ bytes)
 smtp.proto                  ← transport (envelope + delivery)
@@ -30,3 +32,4 @@ crypto.proto                ← end-to-end encryption (S/MIME + PGP)
 calendar.proto              ← meeting invitations (iMIP/iTIP)
 reputation.proto            ← feedback loops + deliverability
 bounce.proto                ← bounce classification + processing
+```
