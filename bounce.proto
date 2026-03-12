@@ -1,0 +1,117 @@
+syntax = "proto3";
+package bounce;
+
+import "smtp.proto";
+import "google/protobuf/timestamp.proto";
+
+// ═══════════════════════════════════════════
+//  Bounce classification
+// ═══════════════════════════════════════════
+//
+//  Raw DSNs/NDRs are messy: different MTAs format them differently,
+//  many don't include structured status codes, and some bounces
+//  aren't even proper DSNs (just human-readable text).
+//  This service normalizes all of that.
+
+message ClassifiedBounce {
+  string    original_recipient = 1;
+  string    original_message_id = 2;
+  Category  category           = 3;
+  string    enhanced_status    = 4;   // RFC 3463 if available
+  string    diagnostic         = 5;   // raw diagnostic text
+  string    remote_mta         = 6;
+  google.protobuf.Timestamp bounced_at = 7;
+
+  // The underlying DSN if one was present
+  smtp.DSN  dsn = 8;
+
+  enum Category {
+    // ── Hard bounces (permanent, suppress immediately) ──
+    INVALID_RECIPIENT   = 0;   // user unknown, mailbox doesn't exist
+    DOMAIN_NOT_FOUND    = 1;   // MX lookup failed / domain doesn't exist
+    POLICY_REJECTION    = 2;   // sender blocked by policy
+    PROTOCOL_ERROR      = 3;   // permanent protocol-level failure
+
+    // ── Soft bounces (transient, retry then suppress) ──
+    MAILBOX_FULL        = 4;   // over quota — try again later
+    TEMPORARY_FAILURE   = 5;   // 4xx / greylisting / rate limit
+    CONTENT_REJECTION   = 6;   // message content triggered a filter
+    NETWORK_ERROR       = 7;   // connection timeout, DNS timeout
+
+    // ── Administrative ──
+    AUTO_REPLY          = 8;   // OOO / vacation (not a real bounce)
+    CHALLENGE_RESPONSE  = 9;   // C/R anti-spam system
+    TRANSIENT_RATE_LIMIT = 10; // explicit rate limiting
+
+    // ── Unclassifiable ──
+    UNKNOWN             = 11;  // couldn't parse
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Bounce processing policy
+// ═══════════════════════════════════════════
+
+message BouncePolicy {
+  // After how many soft bounces to treat as hard (suppress)
+  uint32 soft_bounce_threshold    = 1;  // typical: 3-5
+
+  // Time window for counting soft bounces
+  uint32 soft_bounce_window_hours = 2;  // typical: 72
+
+  // Auto-suppress hard bounces immediately?
+  bool   auto_suppress_hard       = 3;  // almost always true
+
+  // Suppress on policy rejection?
+  bool   suppress_policy_blocks   = 4;
+
+  // How long to keep suppression entries before allowing re-verification
+  uint32 suppression_ttl_days     = 5;  // 0 = permanent
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service BounceService {
+  // Parse and classify a bounce message (DSN or freeform NDR)
+  rpc Classify(ClassifyRequest) returns (ClassifiedBounce);
+
+  // Batch classify (for processing a queue of bounces)
+  rpc ClassifyBatch(ClassifyBatchRequest) returns (ClassifyBatchResponse);
+
+  // Process a bounce against policy: classify + decide suppress/retry
+  rpc Process(ProcessRequest) returns (ProcessResponse);
+}
+
+message ClassifyRequest {
+  bytes raw_message = 1;  // the bounce message
+}
+
+message ClassifyBatchRequest {
+  repeated bytes raw_messages = 1;
+}
+
+message ClassifyBatchResponse {
+  repeated ClassifiedBounce bounces = 1;
+}
+
+message ProcessRequest {
+  bytes         raw_message = 1;
+  BouncePolicy  policy      = 2;
+}
+
+message ProcessResponse {
+  ClassifiedBounce bounce   = 1;
+
+  Action action = 2;
+
+  enum Action {
+    SUPPRESS      = 0;  // add to suppression list
+    RETRY         = 1;  // transient, will retry delivery
+    IGNORE        = 2;  // auto-reply / challenge-response, no action needed
+    INVESTIGATE   = 3;  // couldn't classify, needs human review
+  }
+
+  string reason = 3;  // human-readable explanation of the decision
+}
