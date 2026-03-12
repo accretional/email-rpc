@@ -1,0 +1,178 @@
+syntax = "proto3";
+package reputation;
+
+import "google/protobuf/timestamp.proto";
+
+// ═══════════════════════════════════════════
+//  ARF — Abuse Reporting Format (RFC 5965)
+// ═══════════════════════════════════════════
+//
+//  When a recipient marks a message as spam, the mailbox provider
+//  (Gmail, Yahoo, etc.) can send a structured report back to the
+//  sender via a feedback loop (FBL). The format is multipart/report
+//  with a message/feedback-report part.
+
+message AbuseReport {
+  FeedbackType feedback_type = 1;
+  string       user_agent    = 2;  // reporting MUA/system
+  string       version       = 3;  // "1" per RFC 5965
+
+  // ── Incident details ──
+  string       original_mail_from   = 4;
+  string       original_rcpt_to     = 5;
+  repeated string arrival_date      = 6;
+  string       source_ip            = 7;
+  repeated string authentication_results = 8;
+
+  // ── The reported message ──
+  bytes original_message   = 9;   // full message or headers-only
+  bool  headers_only       = 10;
+
+  string reporting_mta     = 11;
+
+  enum FeedbackType {
+    ABUSE      = 0;  // user complaint (spam button)
+    FRAUD      = 1;  // phishing/scam
+    VIRUS      = 2;
+    OTHER      = 3;
+    NOT_SPAM   = 4;  // false positive — user said "not spam"
+    AUTH_FAILURE = 5; // authentication failure report (DMARC ruf)
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Reputation signals (operational model)
+// ═══════════════════════════════════════════
+//
+//  These aren't standardized, but every ESP and mailbox provider
+//  tracks them. This models what Google Postmaster Tools / Microsoft SNDS expose.
+
+message ReputationSnapshot {
+  string domain    = 1;
+  string ip        = 2;  // sending IP
+  google.protobuf.Timestamp timestamp = 3;
+
+  // ── Core metrics ──
+  DomainReputation domain_reputation = 4;
+  IpReputation     ip_reputation     = 5;
+  double           spam_rate         = 6;  // complaint rate (target: < 0.1%)
+  double           bounce_rate       = 7;  // hard bounce rate
+  double           open_rate         = 8;  // engagement signal (proxy for inbox placement)
+
+  // ── Authentication ──
+  double spf_pass_rate   = 9;
+  double dkim_pass_rate  = 10;
+  double dmarc_pass_rate = 11;
+
+  // ── Blocklist status ──
+  repeated BlocklistEntry blocklists = 12;
+
+  enum DomainReputation {
+    HIGH    = 0;
+    MEDIUM  = 1;
+    LOW     = 2;
+    BAD     = 3;
+    UNKNOWN = 4;
+  }
+
+  enum IpReputation {
+    IP_HIGH    = 0;
+    IP_MEDIUM  = 1;
+    IP_LOW     = 2;
+    IP_BAD     = 3;
+    IP_UNKNOWN = 4;
+  }
+}
+
+message BlocklistEntry {
+  string name    = 1;  // "Spamhaus SBL", "Barracuda", "SORBS", etc.
+  bool   listed  = 2;
+  string reason  = 3;
+  string removal_url = 4;
+}
+
+// ═══════════════════════════════════════════
+//  IP warmup — the operational reality of new IPs
+// ═══════════════════════════════════════════
+
+message WarmupSchedule {
+  string ip     = 1;
+  string domain = 2;
+  google.protobuf.Timestamp start_date = 3;
+  repeated WarmupDay days = 4;
+}
+
+message WarmupDay {
+  uint32 day_number      = 1;
+  uint64 max_sends       = 2;  // daily volume cap
+  string target_audience = 3;  // "most engaged", "engaged 30d", "all"
+}
+
+// ═══════════════════════════════════════════
+//  Suppression — bounce/complaint management
+// ═══════════════════════════════════════════
+
+message SuppressionEntry {
+  string  address = 1;
+  Reason  reason  = 2;
+  google.protobuf.Timestamp suppressed_at = 3;
+  string  source  = 4;  // "hard_bounce", "fbl_complaint", "list_unsubscribe", "manual"
+
+  enum Reason {
+    HARD_BOUNCE  = 0;  // 5xx permanent failure
+    COMPLAINT    = 1;  // FBL abuse report / spam button
+    UNSUBSCRIBE  = 2;  // List-Unsubscribe action
+    MANUAL       = 3;
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service ReputationService {
+  // ── Feedback loop processing ──
+  rpc ParseAbuseReport(ParseReportRequest) returns (AbuseReport);
+  rpc SubmitFeedback(AbuseReport) returns (SubmitResponse);
+
+  // ── Reputation monitoring ──
+  rpc GetReputation(ReputationRequest) returns (ReputationSnapshot);
+  rpc CheckBlocklists(BlocklistRequest) returns (BlocklistResponse);
+
+  // ── Suppression list management ──
+  rpc CheckSuppression(SuppressionCheckRequest) returns (SuppressionCheckResponse);
+  rpc AddSuppression(SuppressionEntry) returns (SuppressionResponse);
+  rpc RemoveSuppression(SuppressionRemoveRequest) returns (SuppressionResponse);
+
+  // ── Warmup ──
+  rpc GetWarmupSchedule(WarmupRequest) returns (WarmupSchedule);
+  rpc GenerateWarmupSchedule(GenerateWarmupRequest) returns (WarmupSchedule);
+}
+
+message ParseReportRequest  { bytes raw_message = 1; }
+message SubmitResponse      { bool accepted = 1; }
+
+message ReputationRequest {
+  string domain = 1;
+  string ip     = 2;
+}
+
+message BlocklistRequest    { repeated string ips = 1; repeated string domains = 2; }
+message BlocklistResponse   { repeated BlocklistEntry entries = 1; }
+
+message SuppressionCheckRequest  { string address = 1; }
+message SuppressionCheckResponse { bool suppressed = 1; SuppressionEntry entry = 2; }
+message SuppressionResponse      { bool success = 1; }
+message SuppressionRemoveRequest { string address = 1; }
+
+message WarmupRequest {
+  string ip = 1;
+  string domain = 2;
+}
+
+message GenerateWarmupRequest {
+  string ip                = 1;
+  string domain            = 2;
+  uint64 target_daily_volume = 3;  // eventual daily send volume
+  google.protobuf.Timestamp start_date = 4;
+}
