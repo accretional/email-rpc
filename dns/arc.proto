@@ -1,0 +1,127 @@
+syntax = "proto3";
+package dns.arc;
+
+import "dns/spf.proto";
+import "dns/dkim.proto";
+import "dns/dmarc.proto";
+
+// ═══════════════════════════════════════════
+//  The ARC set — one per hop
+// ═══════════════════════════════════════════
+//
+//  Each intermediary adds three headers, all sharing the same instance number (i=):
+//
+//  1. AAR (ARC-Authentication-Results): the auth results this hop observed
+//  2. AMS (ARC-Message-Signature):     DKIM-like signature covering the message
+//  3. AS  (ARC-Seal):                  signature covering all previous ARC sets
+//
+//  The seal is the key innovation: it creates a tamper-evident chain.
+//  Each hop signs over all prior seals, so you can detect if a middle
+//  hop was removed or modified.
+
+message ArcSet {
+  uint32                    instance = 1;  // i= (1-based, monotonically increasing)
+  AuthenticationResults     aar      = 2;
+  MessageSignature          ams      = 3;
+  Seal                      seal     = 4;
+}
+
+// AAR: what this hop saw when it received the message
+message AuthenticationResults {
+  uint32                              instance = 1;
+  string                              authserv_id = 2;  // identifier of the verifying system
+  dns.spf.CheckResult                 spf     = 3;
+  repeated dns.dkim.VerifyResult      dkim    = 4;
+  dns.dmarc.EvaluationResult          dmarc   = 5;
+}
+
+// AMS: DKIM-like signature by the intermediary
+// Uses the same structure as a DKIM signature because it IS one,
+// just with a different header name and the instance tag.
+message MessageSignature {
+  uint32                         instance       = 1;
+  dns.dkim.Algorithm             algorithm      = 2;
+  string                         domain         = 3;  // signing intermediary's domain
+  string                         selector       = 4;
+  dns.dkim.Canonicalization      header_canon   = 5;
+  dns.dkim.Canonicalization      body_canon     = 6;
+  repeated string                signed_headers = 7;
+  bytes                          body_hash      = 8;
+  bytes                          signature_data = 9;
+  uint64                         timestamp      = 10;
+}
+
+// AS: the seal that chains everything together
+// Signs over ALL previous ARC header sets (AAR + AMS + AS for instances 1..i-1)
+// plus its own AAR and AMS.
+message Seal {
+  uint32             instance       = 1;
+  dns.dkim.Algorithm algorithm      = 2;
+  string             domain         = 3;
+  string             selector       = 4;
+  bytes              signature_data = 5;
+  uint64             timestamp      = 6;
+  ChainValidation    cv             = 7;  // this hop's assessment of the chain so far
+
+  enum ChainValidation {
+    NONE = 0;  // no prior ARC sets existed (i=1)
+    PASS = 1;  // all prior seals verified
+    FAIL = 2;  // chain is broken — prior seal didn't verify
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Validation result
+// ═══════════════════════════════════════════
+
+message ChainValidationResult {
+  Result            result = 1;
+  repeated ArcSet   chain  = 2;  // all ARC sets, ordered by instance
+  string            reason = 3;
+
+  enum Result {
+    PASS      = 0;  // complete chain verified, all seals valid
+    FAIL      = 1;  // at least one seal broken, or cv=fail encountered
+    NONE      = 2;  // no ARC headers present
+    TEMPERROR = 3;
+    PERMERROR = 4;
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service ArcService {
+  // Intermediary: add a new ARC set before forwarding
+  rpc Seal(SealRequest) returns (SealResponse);
+
+  // Final receiver: validate the entire chain
+  rpc Validate(ValidateRequest) returns (ChainValidationResult);
+}
+
+message SealRequest {
+  bytes  message          = 1;  // current message (may already have ARC headers)
+  string source_ip        = 2;  // IP the intermediary received from
+  string helo_domain      = 3;
+  string envelope_from    = 4;
+
+  // Signing identity of this intermediary
+  string signing_domain   = 5;
+  string selector         = 6;
+  bytes  private_key      = 7;
+  dns.dkim.Algorithm algorithm = 8;
+}
+
+message SealResponse {
+  // The three headers to prepend
+  string aar_header = 1;
+  string ams_header = 2;
+  string as_header  = 3;
+  bytes  message    = 4;  // message with ARC headers prepended
+  uint32 instance   = 5;  // the instance number assigned
+}
+
+message ValidateRequest {
+  bytes message = 1;
+}
