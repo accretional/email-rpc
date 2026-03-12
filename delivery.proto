@@ -1,0 +1,87 @@
+syntax = "proto3";
+package delivery;
+
+import "mail.proto";
+import "smtp.proto";
+import "dns/mx.proto";
+import "dns/spf.proto";
+import "dns/dkim.proto";
+import "dns/dmarc.proto";
+
+// ═══════════════════════════════════════════
+//  Outbound pipeline result
+// ═══════════════════════════════════════════
+//
+//  mail.Message
+//    → MimeCodec.Encode      (message → bytes)
+//    → DkimService.Sign      (attach signature)
+//    → MxResolver.Resolve    (find destination server, per recipient domain)
+//    → SmtpService.Deliver   (transmit)
+
+message OutboundDelivery {
+  string                           recipient_domain = 1;
+  dns.mx.ResolvedRoute             route            = 2;
+  repeated smtp.TransactionResult  results          = 3;
+  smtp.Session                     session          = 4;
+}
+
+// ═══════════════════════════════════════════
+//  Inbound authentication result
+// ═══════════════════════════════════════════
+//
+//  raw message + connection metadata
+//    → SpfService.Check       (is this IP authorized?)
+//    → DkimService.Verify     (was this message tampered with?)
+//    → DmarcService.Evaluate  (do SPF/DKIM align with From: header? what's the policy?)
+
+message InboundAuthResult {
+  dns.spf.CheckResult              spf   = 1;
+  repeated dns.dkim.VerifyResult   dkim  = 2;
+  dns.dmarc.EvaluationResult       dmarc = 3;
+
+  // The Authentication-Results header to stamp on the message
+  // (RFC 8601 — this is how results are communicated to downstream MUAs)
+  string authentication_results_header = 4;
+
+  Disposition disposition = 5;
+  enum Disposition {
+    ACCEPT     = 0;
+    QUARANTINE = 1;
+    REJECT     = 2;
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service DeliveryService {
+  // Outbound: full pipeline from mail.Message to remote delivery
+  rpc Send(OutboundRequest) returns (OutboundResponse);
+
+  // Inbound: authenticate a received message
+  rpc Authenticate(InboundRequest) returns (InboundAuthResult);
+}
+
+message OutboundRequest {
+  mail.Message message = 1;
+
+  // DKIM signing configuration
+  string signing_domain  = 2;
+  string dkim_selector   = 3;
+  bytes  dkim_private_key = 4;
+
+  smtp.DeliveryOptions options = 5;
+}
+
+message OutboundResponse {
+  // Results grouped by destination domain (each may have different MX)
+  repeated OutboundDelivery deliveries = 1;
+}
+
+message InboundRequest {
+  bytes  raw_message   = 1;  // received RFC 5322 message
+  string source_ip     = 2;  // connecting client IP
+  string helo_domain   = 3;  // EHLO identity
+  string envelope_from = 4;  // MAIL FROM
+}
