@@ -1,0 +1,224 @@
+syntax = "proto3";
+package sieve;
+
+// ═══════════════════════════════════════════
+//  Script management (ManageSieve protocol)
+// ═══════════════════════════════════════════
+//
+//  Sieve scripts are managed separately from IMAP.
+//  ManageSieve runs on its own port (4190) with its own auth.
+//  Only ONE script can be active at a time.
+
+message Script {
+  string name    = 1;
+  string content = 2;  // raw Sieve source
+  bool   active  = 3;  // at most one script is active
+}
+
+// ═══════════════════════════════════════════
+//  Parsed script structure
+// ═══════════════════════════════════════════
+//
+//  The Sieve language is a tree of if/elsif/else blocks
+//  with test conditions and action commands.
+//  It's deliberately NOT Turing-complete.
+
+message ParsedScript {
+  repeated string    requires = 1;  // require ["fileinto", "reject", "vacation"];
+  repeated Rule      rules    = 2;
+}
+
+message Rule {
+  Test             condition = 1;  // null for unconditional (final else / bare action)
+  repeated Action  actions   = 2;
+  repeated Rule    elsif     = 3;  // elsif chains
+  repeated Action  else_actions = 4;
+}
+
+// ═══════════════════════════════════════════
+//  Tests — the condition language
+// ═══════════════════════════════════════════
+
+message Test {
+  oneof test {
+    // Header tests (RFC 5228)
+    HeaderTest     header    = 1;   // if header :contains "Subject" "urgent"
+    AddressTest    address   = 2;   // if address :is :all "from" "alice@example.com"
+    EnvelopeTest   envelope  = 3;   // test envelope sender/recipient
+    SizeTest       size      = 4;   // if size :over 1M
+    ExistsTest     exists    = 5;   // if exists "X-Custom-Header"
+
+    // Logic
+    AllOfTest      allof     = 6;   // AND
+    AnyOfTest      anyof     = 7;   // OR
+    NotTest        not       = 8;
+
+    // Literals
+    bool           true_test  = 9;
+    bool           false_test = 10;
+
+    // Extensions (common, each requires its own "require")
+    BodyTest       body       = 11;  // RFC 5173: body content test
+    SpamTest       spamtest   = 12;  // RFC 5235: test spam score
+    DateTest       date       = 13;  // RFC 5260: test date fields
+    CurrentDateTest currentdate = 14;  // RFC 5260: test current time
+  }
+}
+
+message HeaderTest {
+  repeated string header_names = 1;  // which headers to examine
+  repeated string key_list     = 2;  // values to match against
+  MatchType       match_type   = 3;
+  Comparator      comparator   = 4;
+}
+
+message AddressTest {
+  repeated string header_names = 1;
+  repeated string key_list     = 2;
+  MatchType       match_type   = 3;
+  AddressPart     address_part = 4;
+  Comparator      comparator   = 5;
+
+  enum AddressPart {
+    ALL       = 0;  // full address
+    LOCALPART = 1;  // left of @
+    DOMAIN    = 2;  // right of @
+  }
+}
+
+message EnvelopeTest {
+  repeated string envelope_parts = 1;  // "from", "to"
+  repeated string key_list       = 2;
+  MatchType       match_type     = 3;
+}
+
+message SizeTest {
+  bool   over  = 1;  // :over (true) or :under (false)
+  uint64 limit = 2;  // bytes
+}
+
+message ExistsTest        { repeated string header_names = 1; }
+message AllOfTest         { repeated Test tests = 1; }
+message AnyOfTest         { repeated Test tests = 1; }
+message NotTest           { Test test = 1; }
+message BodyTest          { repeated string key_list = 1; MatchType match_type = 2; }
+message SpamTest          { string value = 1; MatchType match_type = 2; }
+message DateTest          { string header = 1; string date_part = 2; repeated string key_list = 3; }
+message CurrentDateTest   { string date_part = 1; repeated string key_list = 2; }
+
+enum MatchType {
+  IS       = 0;  // exact match
+  CONTAINS = 1;  // substring
+  MATCHES  = 2;  // glob pattern (*, ?)
+  REGEX    = 3;  // requires "regex" extension
+}
+
+message Comparator {
+  string name = 1;  // "i;ascii-casemap" (default), "i;octet", "i;ascii-numeric"
+}
+
+// ═══════════════════════════════════════════
+//  Actions — what to do with a matched message
+// ═══════════════════════════════════════════
+
+message Action {
+  oneof action {
+    // Core actions (RFC 5228)
+    KeepAction     keep     = 1;   // deliver to default mailbox (implicit if no other)
+    FileintoAction fileinto = 2;   // deliver to named mailbox
+    RedirectAction redirect = 3;   // forward to another address
+    DiscardAction  discard  = 4;   // silently drop (no bounce)
+    StopAction     stop     = 5;   // end script execution
+
+    // Extension actions
+    RejectAction   reject   = 6;   // RFC 5429: reject with bounce message
+    ErejectAction  ereject  = 7;   // RFC 5429: reject at SMTP level (preferred)
+    VacationAction vacation = 8;   // RFC 5230: auto-reply
+    FlagAction     flag     = 9;   // RFC 5232: set IMAP flags (imap4flags)
+    NotifyAction   notify   = 10;  // RFC 5435: external notification
+  }
+}
+
+message KeepAction     {}
+message FileintoAction { string mailbox = 1; }  // e.g., "INBOX.Archive"
+message RedirectAction { string address = 1; }
+message DiscardAction  {}
+message StopAction     {}
+
+message RejectAction   { string reason = 1; }   // text sent in the bounce
+message ErejectAction  { string reason = 1; }   // text used in SMTP rejection
+
+message VacationAction {
+  string          reason     = 1;  // response body
+  string          subject    = 2;
+  repeated string addresses  = 3;  // which of my addresses trigger this
+  uint32          days       = 4;  // minimum days between responses to same sender
+  string          from       = 5;  // reply-from address
+  string          mime       = 6;  // raw MIME for rich responses
+}
+
+message FlagAction {
+  FlagOp          operation = 1;
+  repeated string flags     = 2;  // "\\Seen", "\\Flagged", "$Important", etc.
+
+  enum FlagOp {
+    SET    = 0;  // setflag
+    ADD    = 1;  // addflag
+    REMOVE = 2;  // removeflag
+  }
+}
+
+message NotifyAction {
+  string method    = 1;  // "mailto:admin@example.com", "xmpp:...", etc.
+  string message   = 2;
+  string importance = 3;  // "1" (high), "2" (normal), "3" (low)
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service SieveService {
+  // ── Script management (ManageSieve) ──
+  rpc List(ListRequest) returns (ListResponse);
+  rpc Get(GetRequest) returns (Script);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Activate(ActivateRequest) returns (ActivateResponse);
+
+  // ── Validation ──
+  rpc Check(CheckRequest) returns (CheckResponse);
+
+  // ── Capabilities ──
+  rpc Capabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+}
+
+message ListRequest  {}
+message ListResponse { repeated Script scripts = 1; }
+
+message GetRequest    { string name = 1; }
+
+message PutRequest    { string name = 1; string content = 2; }
+message PutResponse   { bool success = 1; repeated string warnings = 2; }
+
+message DeleteRequest   { string name = 1; }
+message DeleteResponse  { bool success = 1; }
+
+message ActivateRequest  { string name = 1; }  // empty name = deactivate all
+message ActivateResponse { bool success = 1; }
+
+message CheckRequest  { string content = 1; }
+message CheckResponse {
+  bool            valid  = 1;
+  repeated string errors = 2;  // line/column + description
+  ParsedScript    parsed = 3;  // structured representation if valid
+}
+
+message CapabilitiesRequest {}
+message CapabilitiesResponse {
+  repeated string extensions  = 1;  // "fileinto", "reject", "vacation", "regex", etc.
+  repeated string comparators = 2;  // "i;ascii-casemap", "i;octet", etc.
+  string          version     = 3;  // "1.0"
+  repeated string notify_methods = 4;  // "mailto", "xmpp", etc.
+  uint64          max_script_size = 5;
+}
