@@ -1,0 +1,96 @@
+syntax = "proto3";
+package dns.bimi;
+
+import "dns/dmarc.proto";
+
+// ═══════════════════════════════════════════
+//  BIMI record
+// ═══════════════════════════════════════════
+
+message BimiRecord {
+  string version    = 1;  // "BIMI1"
+  string location   = 2;  // l= URI to SVG Tiny PS logo
+  string authority  = 3;  // a= URI to VMC (Verified Mark Certificate) in PEM
+  // Empty authority = self-asserted (some receivers honor this, most don't)
+}
+
+// ═══════════════════════════════════════════
+//  VMC — the certificate that proves logo ownership
+// ═══════════════════════════════════════════
+//
+//  A VMC is an X.509 certificate with a specific extension (id-pe-logotype)
+//  that binds a trademarked logo to a domain. Issued by mark verifying
+//  authorities (DigiCert, Entrust). Costs $$$ because it requires
+//  trademark verification.
+
+message VerifiedMarkCertificate {
+  bytes  pem              = 1;
+  string domain           = 2;   // the domain the VMC covers
+  string issuer           = 3;
+  string serial           = 4;
+  int64  not_before       = 5;
+  int64  not_after        = 6;
+  string trademark_office = 7;   // e.g., "USPTO", "EUIPO"
+  string registration_number = 8;
+  bytes  embedded_logo    = 9;   // SVG Tiny PS extracted from the cert extension
+}
+
+// ═══════════════════════════════════════════
+//  Evaluation
+// ═══════════════════════════════════════════
+
+message BimiResult {
+  Result result    = 1;
+  bytes  logo_svg  = 2;  // the SVG to display (null if not valid)
+  string reason    = 3;
+
+  BimiRecord                    record = 4;
+  VerifiedMarkCertificate       vmc    = 5;
+  dns.dmarc.EvaluationResult    dmarc  = 6;
+
+  enum Result {
+    PASS       = 0;  // DMARC passed, BIMI record valid, VMC verified, logo available
+    DECLINED   = 1;  // self-asserted (no VMC) — receiver chooses whether to display
+    FAIL       = 2;  // DMARC failed, or DMARC policy too weak (p=none)
+    NONE       = 3;  // no BIMI record
+    TEMPERROR  = 4;
+    PERMERROR  = 5;  // invalid record, invalid VMC, etc.
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service BimiService {
+  // Look up BIMI record for a domain
+  rpc Lookup(LookupRequest) returns (BimiRecord);
+
+  // Fetch and validate the VMC
+  rpc ValidateVmc(VmcRequest) returns (VmcResponse);
+
+  // Full evaluation: DMARC check + BIMI record + VMC validation + logo fetch
+  rpc Evaluate(EvaluateRequest) returns (BimiResult);
+}
+
+message LookupRequest {
+  string domain   = 1;
+  string selector = 2;  // default is "default"
+}
+
+message VmcRequest {
+  string authority_uri = 1;  // the a= value from the BIMI record
+}
+
+message VmcResponse {
+  bool                       valid = 1;
+  VerifiedMarkCertificate    vmc   = 2;
+  string                     reason = 3;
+}
+
+message EvaluateRequest {
+  // DMARC result from prior evaluation
+  dns.dmarc.EvaluationResult dmarc_result = 1;
+  string                     from_domain  = 2;
+  string                     selector     = 3;
+}
