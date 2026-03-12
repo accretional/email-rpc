@@ -1,0 +1,287 @@
+syntax = "proto3";
+package jmap;
+
+import "google/protobuf/timestamp.proto";
+
+// ═══════════════════════════════════════════
+//  Core protocol — the JMAP request model
+// ═══════════════════════════════════════════
+//
+//  JMAP is JSON-over-HTTPS. Every request is a batch of method calls.
+//  Results can reference prior calls in the same batch using "#" references.
+//  This is how you do "search for messages, then fetch them" in one round-trip.
+
+message Request {
+  repeated MethodCall calls = 1;
+  // Each call can reference results from earlier calls in the same batch.
+  // This eliminates the multi-roundtrip problem that plagues IMAP.
+}
+
+message MethodCall {
+  string name         = 1;  // "Email/get", "Email/query", "Email/set", etc.
+  string call_id      = 2;  // client-assigned ID for result correlation
+  string account_id   = 3;
+
+  oneof method {
+    GetRequest      get     = 4;
+    ChangesRequest  changes = 5;
+    SetRequest      set     = 6;
+    QueryRequest    query   = 7;
+    QueryChangesRequest query_changes = 8;
+  }
+}
+
+message Response {
+  repeated MethodResponse responses = 1;
+  string                  session_state = 2;
+}
+
+message MethodResponse {
+  string name    = 1;  // matches the method call
+  string call_id = 2;
+
+  oneof result {
+    GetResponse      get     = 3;
+    ChangesResponse  changes = 4;
+    SetResponse      set     = 5;
+    QueryResponse    query   = 6;
+    ErrorResponse    error   = 7;
+  }
+}
+
+// ═══════════════════════════════════════════
+//  The four verbs
+// ═══════════════════════════════════════════
+
+// Foo/get: fetch specific objects by ID
+message GetRequest {
+  repeated string ids        = 1;  // null = get all
+  repeated string properties = 2;  // null = all properties (partial fetch)
+}
+
+message GetResponse {
+  string          state    = 1;  // opaque state token
+  repeated bytes  list     = 2;  // serialized objects (Email, Mailbox, Thread, etc.)
+  repeated string not_found = 3;
+}
+
+// Foo/changes: what changed since state X?
+// This is the delta sync mechanism — vastly more efficient than IMAP re-scan.
+message ChangesRequest {
+  string since_state = 1;  // state token from a prior get/changes
+  uint32 max_changes = 2;
+}
+
+message ChangesResponse {
+  string          old_state = 1;
+  string          new_state = 2;
+  bool            has_more  = 3;
+  repeated string created   = 4;  // IDs of new objects
+  repeated string updated   = 5;  // IDs of modified objects
+  repeated string destroyed = 6;  // IDs of deleted objects
+}
+
+// Foo/set: create, update, delete objects
+message SetRequest {
+  string                    if_in_state = 1;  // optimistic concurrency
+  map<string, bytes>        create      = 2;  // temporary ID → object
+  map<string, bytes>        update      = 3;  // ID → patch object
+  repeated string           destroy     = 4;  // IDs to delete
+}
+
+message SetResponse {
+  string                    old_state   = 1;
+  string                    new_state   = 2;
+  map<string, bytes>        created     = 3;  // temp ID → created object
+  map<string, bytes>        updated     = 4;
+  repeated string           destroyed   = 5;
+  map<string, SetError>     not_created = 6;
+  map<string, SetError>     not_updated = 7;
+  map<string, SetError>     not_destroyed = 8;
+}
+
+message SetError {
+  string type        = 1;  // "notFound", "forbidden", "stateMismatch", etc.
+  string description = 2;
+}
+
+// Foo/query: search and sort, returns IDs
+message QueryRequest {
+  bytes  filter    = 1;  // type-specific filter (see EmailFilter)
+  bytes  sort      = 2;  // type-specific sort
+  uint32 position  = 3;
+  uint32 limit     = 4;
+  string anchor    = 5;  // ID to anchor relative positioning
+}
+
+message QueryResponse {
+  string          state    = 1;
+  repeated string ids      = 2;
+  uint32          position = 3;
+  uint64          total    = 4;
+  bool            can_calculate_changes = 5;
+}
+
+message QueryChangesRequest {
+  string since_state = 1;
+  bytes  filter      = 2;
+  bytes  sort        = 3;
+}
+
+// ═══════════════════════════════════════════
+//  Email object — JMAP's mail data model
+// ═══════════════════════════════════════════
+
+message Email {
+  string id         = 1;
+  string blob_id    = 2;   // reference to the raw RFC 5322 blob
+  string thread_id  = 3;   // server-assigned thread grouping
+  repeated string mailbox_ids = 4;  // which mailboxes contain this (replaces IMAP copy)
+
+  // ── Headers (structured) ──
+  repeated EmailAddress from      = 5;
+  repeated EmailAddress to        = 6;
+  repeated EmailAddress cc        = 7;
+  repeated EmailAddress bcc       = 8;
+  repeated EmailAddress reply_to  = 9;
+  string subject                  = 10;
+  string message_id               = 11;
+  string in_reply_to              = 12;
+  repeated string references      = 13;
+  google.protobuf.Timestamp sent_at = 14;
+  google.protobuf.Timestamp received_at = 15;
+
+  // ── Keywords (replaces IMAP flags) ──
+  //    Standardized: $seen, $flagged, $answered, $draft, $forwarded
+  //    Custom: anything else
+  map<string, bool> keywords = 16;
+
+  // ── Body ──
+  repeated EmailBodyPart text_body = 17;  // text/* parts (for text clients)
+  repeated EmailBodyPart html_body = 18;  // text/html parts (for rich clients)
+  repeated EmailBodyPart attachments = 19;
+  bool has_attachment = 20;
+
+  uint64 size  = 21;  // total RFC 5322 size
+  string preview = 22;  // server-generated plaintext snippet (up to 256 chars)
+}
+
+message EmailAddress {
+  string name  = 1;
+  string email = 2;
+}
+
+message EmailBodyPart {
+  string part_id    = 1;
+  string blob_id    = 2;  // fetchable via Blob/get
+  string type       = 3;  // MIME type
+  string charset    = 4;
+  string name       = 5;  // Content-Disposition filename
+  string disposition = 6;  // inline | attachment
+  string cid        = 7;  // Content-ID
+  uint64 size       = 8;
+  repeated EmailBodyPart sub_parts = 9;  // MIME tree nesting
+}
+
+// ═══════════════════════════════════════════
+//  Email query filter
+// ═══════════════════════════════════════════
+
+message EmailFilter {
+  oneof filter {
+    FilterOperator operator = 1;
+    FilterCondition condition = 2;
+  }
+}
+
+message FilterOperator {
+  string           op       = 1;  // "AND", "OR", "NOT"
+  repeated EmailFilter conditions = 2;
+}
+
+message FilterCondition {
+  string   in_mailbox     = 1;   // mailbox ID
+  string   in_mailbox_other_than = 2;
+  string   from           = 3;   // text match on From
+  string   to             = 4;
+  string   cc             = 5;
+  string   subject        = 6;
+  string   body           = 7;
+  string   text           = 8;   // full-text across all fields
+  string   has_keyword    = 9;
+  string   not_keyword    = 10;
+  bool     has_attachment  = 11;
+  google.protobuf.Timestamp before = 12;
+  google.protobuf.Timestamp after  = 13;
+  uint64   min_size       = 14;
+  uint64   max_size       = 15;
+}
+
+// ═══════════════════════════════════════════
+//  Push — server-sent events
+// ═══════════════════════════════════════════
+//
+//  JMAP push is fundamentally different from IMAP IDLE:
+//  - IDLE: one connection per mailbox, tells you "something changed"
+//  - JMAP push: single channel, tells you which types changed state
+//  Client then calls Foo/changes to get the delta.
+
+message StateChange {
+  map<string, string> changed = 1;  // type → new state: {"Email": "abc", "Mailbox": "def"}
+}
+
+message PushSubscription {
+  string id            = 1;
+  string url           = 2;  // where to POST state changes
+  repeated string types = 3;  // which types to watch: ["Email", "Mailbox", "Thread"]
+  google.protobuf.Timestamp expires = 4;
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service JmapService {
+  // Session discovery (replaces IMAP capability + autoconfig)
+  rpc GetSession(SessionRequest) returns (Session);
+
+  // The single batch endpoint — all operations go through here
+  rpc Execute(Request) returns (Response);
+
+  // Push subscription management
+  rpc SubscribePush(PushSubscription) returns (PushSubscription);
+
+  // Server-sent event stream (alternative to push subscriptions)
+  rpc EventSource(EventSourceRequest) returns (stream StateChange);
+}
+
+message SessionRequest {}
+
+message Session {
+  map<string, Account>  accounts     = 1;
+  string                primary_accounts_mail = 2;
+  string                state        = 3;
+  Capabilities          capabilities = 4;
+}
+
+message Account {
+  string name                = 1;
+  bool   is_personal         = 2;
+  bool   is_read_only        = 3;
+  repeated string data_types = 4;  // ["Email", "Mailbox", "Thread", "Identity", ...]
+}
+
+message Capabilities {
+  uint64 max_size_upload       = 1;
+  uint32 max_concurrent_upload = 2;
+  uint64 max_size_request      = 3;
+  uint32 max_concurrent_requests = 4;
+  uint32 max_calls_in_request  = 5;
+  uint32 max_objects_in_get    = 6;
+  uint32 max_objects_in_set    = 7;
+}
+
+message EventSourceRequest {
+  repeated string types = 1;
+  string          ping  = 2;  // interval for keep-alive
+}
