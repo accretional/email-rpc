@@ -1,0 +1,232 @@
+syntax = "proto3";
+package queue;
+
+import "smtp.proto";
+import "dns/mx.proto";
+import "bounce.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+// ═══════════════════════════════════════════
+//  Queue entry — one message in the queue
+// ═══════════════════════════════════════════
+//
+//  A single queued message may have recipients in different states:
+//  some delivered, some deferred, some permanently failed.
+//  The queue tracks each recipient independently.
+
+message QueueEntry {
+  string id            = 1;  // queue ID (e.g., Postfix-style: "A1B2C3D4E5")
+  string envelope_from = 2;
+  bytes  message_ref   = 3;  // reference to stored message data (path or blob ID)
+  uint64 message_size  = 4;
+
+  google.protobuf.Timestamp enqueued_at   = 5;  // when first accepted
+  google.protobuf.Timestamp expires_at    = 6;  // give up entirely after this
+  // RFC 5321 recommends: "at least 4-5 days" total retry window
+
+  repeated RecipientState recipients = 7;
+
+  EntryStatus status = 8;
+
+  Origin origin = 9;
+
+  enum EntryStatus {
+    ACTIVE   = 0;  // being delivered right now
+    DEFERRED = 1;  // waiting for next retry
+    HELD     = 2;  // administratively paused
+    CORRUPT  = 3;  // unreadable / damaged
+  }
+
+  enum Origin {
+    SUBMISSION = 0;  // from an authenticated local user (port 587)
+    RELAY      = 1;  // from another MTA (port 25)
+    BOUNCE     = 2;  // locally generated DSN
+    INTERNAL   = 3;  // system-generated (alerts, reports, etc.)
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Per-recipient state within a queue entry
+// ═══════════════════════════════════════════
+
+message RecipientState {
+  string address = 1;
+  string domain  = 2;  // extracted for MX grouping
+
+  Status status = 3;
+
+  // Delivery attempt history
+  repeated DeliveryAttempt attempts = 4;
+
+  // Next scheduled retry (if deferred)
+  google.protobuf.Timestamp next_attempt = 5;
+
+  // DSN notification preferences (RFC 3461)
+  DsnRequest dsn = 6;
+
+  enum Status {
+    PENDING   = 0;  // not yet attempted
+    ACTIVE    = 1;  // delivery in progress
+    DELIVERED = 2;  // successfully delivered (will be purged)
+    DEFERRED  = 3;  // temporary failure, will retry
+    BOUNCED   = 4;  // permanent failure, DSN generated
+    EXPIRED   = 5;  // retry window exhausted, DSN generated
+  }
+}
+
+message DeliveryAttempt {
+  google.protobuf.Timestamp timestamp  = 1;
+  smtp.TransactionResult    result     = 2;
+  dns.mx.ResolvedRoute      route_used = 3;  // which MX was tried
+  string                    remote_ip  = 4;
+  google.protobuf.Duration  duration   = 5;  // how long the attempt took
+}
+
+// RFC 3461: per-recipient DSN request from the sender
+message DsnRequest {
+  repeated DsnNotify notify    = 1;
+  string             envid     = 2;  // envelope ID for correlation
+  DsnRet             ret       = 3;  // what to return in the DSN
+
+  enum DsnNotify {
+    NEVER   = 0;  // don't send DSNs
+    SUCCESS = 1;  // notify on successful delivery
+    FAILURE = 2;  // notify on permanent failure (default)
+    DELAY   = 3;  // notify on temporary failure / delay
+  }
+
+  enum DsnRet {
+    FULL    = 0;  // return the full original message in the DSN
+    HDRS    = 1;  // return only headers
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Retry policy
+// ═══════════════════════════════════════════
+//
+//  RFC 5321 §4.5.4.1:
+//    "The sender MUST delay retrying a particular destination
+//     after one attempt has failed. In general, the retry interval
+//     SHOULD be at least 30 minutes."
+//
+//  In practice, MTAs use exponential backoff with jitter.
+
+message RetryPolicy {
+  google.protobuf.Duration initial_interval   = 1;  // first retry delay (typ: 5-15 min)
+  google.protobuf.Duration max_interval        = 2;  // cap between retries (typ: 4-6 hours)
+  double                   backoff_multiplier  = 3;  // exponential factor (typ: 2.0)
+  double                   jitter_factor       = 4;  // random ± percentage (typ: 0.25)
+  google.protobuf.Duration max_lifetime        = 5;  // total retry window (typ: 4-5 days)
+  uint32                   max_attempts         = 6;  // hard cap on attempts (0 = lifetime only)
+
+  // Per-domain overrides (some domains are known to greylist, etc.)
+  repeated DomainOverride domain_overrides = 7;
+}
+
+message DomainOverride {
+  string                   domain_pattern    = 1;  // "gmail.com", "*.yahoo.com"
+  google.protobuf.Duration initial_interval  = 2;
+  uint32                   max_attempts      = 3;
+  uint32                   max_connections   = 4;  // concurrent connection limit to this domain
+  uint32                   rate_per_hour     = 5;  // message rate limit
+}
+
+// ═══════════════════════════════════════════
+//  Queue-level operations
+// ═══════════════════════════════════════════
+
+message QueueStats {
+  uint64 active_count   = 1;  // currently being delivered
+  uint64 deferred_count = 2;  // waiting for retry
+  uint64 held_count     = 3;  // administratively paused
+  uint64 total_size     = 4;  // bytes across all queued messages
+
+  // Breakdown by destination domain
+  repeated DomainStats domain_stats = 5;
+}
+
+message DomainStats {
+  string domain         = 1;
+  uint64 queued_count   = 2;
+  uint64 deferred_count = 3;
+  google.protobuf.Timestamp oldest_message = 4;
+  string last_error     = 5;  // most recent failure diagnostic
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service QueueService {
+  // ── Enqueue ──
+  rpc Enqueue(EnqueueRequest) returns (EnqueueResponse);
+
+  // ── Inspection ──
+  rpc List(ListRequest) returns (stream QueueEntry);
+  rpc Get(GetRequest) returns (QueueEntry);
+  rpc Stats(StatsRequest) returns (QueueStats);
+
+  // ── Management ──
+  rpc Flush(FlushRequest) returns (FlushResponse);      // force immediate retry
+  rpc Hold(HoldRequest) returns (HoldResponse);          // pause delivery
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);  // resume held entries
+  rpc Delete(DeleteRequest) returns (DeleteResponse);     // remove from queue
+  rpc Requeue(RequeueRequest) returns (RequeueResponse);  // re-evaluate routing
+
+  // ── Policy ──
+  rpc GetRetryPolicy(RetryPolicyRequest) returns (RetryPolicy);
+  rpc SetRetryPolicy(RetryPolicy) returns (RetryPolicyResponse);
+}
+
+message EnqueueRequest {
+  string          envelope_from = 1;
+  repeated string recipients    = 2;
+  bytes           message       = 3;
+  QueueEntry.Origin origin      = 4;
+  DsnRequest      dsn           = 5;  // sender's DSN preferences
+}
+
+message EnqueueResponse {
+  string queue_id = 1;
+}
+
+message ListRequest {
+  // Filters
+  QueueEntry.EntryStatus status = 1;
+  string                 domain = 2;  // filter by recipient domain
+  string                 sender = 3;  // filter by envelope sender
+  uint32                 limit  = 4;
+  string                 cursor = 5;
+}
+
+message GetRequest   { string queue_id = 1; }
+message StatsRequest {}
+
+message FlushRequest {
+  oneof scope {
+    string queue_id = 1;  // flush one entry
+    string domain   = 2;  // flush all entries for a domain
+    bool   all      = 3;  // flush everything
+  }
+}
+message FlushResponse   { uint64 flushed_count = 1; }
+
+message HoldRequest     { string queue_id = 1; }
+message HoldResponse    { bool success = 1; }
+
+message ReleaseRequest  { string queue_id = 1; }
+message ReleaseResponse { bool success = 1; }
+
+message DeleteRequest {
+  string queue_id = 1;
+  bool   bounce   = 2;  // generate a DSN before deleting?
+}
+message DeleteResponse  { bool success = 1; }
+
+message RequeueRequest  { string queue_id = 1; }
+message RequeueResponse { bool success = 1; }
+
+message RetryPolicyRequest {}
+message RetryPolicyResponse { bool applied = 1; }
