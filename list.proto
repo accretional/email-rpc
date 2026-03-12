@@ -1,0 +1,96 @@
+syntax = "proto3";
+package list;
+
+// ═══════════════════════════════════════════
+//  List headers — RFC 2369 + RFC 8058
+// ═══════════════════════════════════════════
+//
+//  These are headers that a message carries, not a separate service.
+//  They define machine-actionable URIs for list operations.
+//  In practice, this is how "unsubscribe" works in Gmail/Apple Mail —
+//  they parse these headers and render the UI affordance.
+
+message ListHeaders {
+  // RFC 2369
+  repeated string unsubscribe = 1;  // List-Unsubscribe: <mailto:...>, <https://...>
+  repeated string subscribe   = 2;  // List-Subscribe
+  repeated string post        = 3;  // List-Post (where to send messages to the list)
+  repeated string help        = 4;  // List-Help
+  repeated string archive     = 5;  // List-Archive
+  repeated string owner       = 6;  // List-Owner
+
+  // RFC 8058: one-click unsubscribe
+  // Gmail/Yahoo require this since Feb 2024 for bulk senders.
+  // The MUA sends a POST to the HTTPS URI with "List-Unsubscribe=One-Click"
+  // OR sends a mailto with the specified body.
+  OneClickUnsubscribe one_click = 7;
+
+  string list_id = 8;  // List-ID (RFC 2919): "My List <mylist.example.com>"
+}
+
+message OneClickUnsubscribe {
+  string https_url = 1;  // the POST endpoint
+  string mailto    = 2;  // fallback mailto: URI
+  // List-Unsubscribe-Post: List-Unsubscribe=One-Click
+  // Presence of this header is what signals RFC 8058 support.
+  bool   post_supported = 3;
+}
+
+// ═══════════════════════════════════════════
+//  Service — for list operators / ESPs
+// ═══════════════════════════════════════════
+
+service ListService {
+  // Generate List-* headers for an outgoing message
+  rpc GenerateHeaders(GenerateRequest) returns (GenerateResponse);
+
+  // Process an incoming unsubscribe request (POST or mailto)
+  rpc ProcessUnsubscribe(UnsubscribeRequest) returns (UnsubscribeResponse);
+
+  // Parse List-* headers from a received message
+  rpc ParseHeaders(ParseRequest) returns (ListHeaders);
+}
+
+message GenerateRequest {
+  string list_id                = 1;  // unique list identifier
+  string unsubscribe_https_url  = 2;
+  string unsubscribe_mailto     = 3;
+  string post_address           = 4;  // list posting address
+  string archive_url            = 5;
+  string help_url               = 6;
+  string owner_address          = 7;
+}
+
+message GenerateResponse {
+  // Ready-to-add headers
+  repeated mail.Header headers = 1;
+  ListHeaders          parsed  = 2;
+}
+
+message UnsubscribeRequest {
+  oneof method {
+    HttpPost    http_post = 1;
+    MailtoPost  mailto    = 2;
+  }
+}
+
+message HttpPost {
+  string url  = 1;
+  string body = 2;  // "List-Unsubscribe=One-Click"
+  map<string, string> headers = 3;
+}
+
+message MailtoPost {
+  string to      = 1;
+  string subject = 2;
+  string body    = 3;
+}
+
+message UnsubscribeResponse {
+  bool   success = 1;
+  string message = 2;
+}
+
+message ParseRequest {
+  bytes raw_message = 1;
+}
