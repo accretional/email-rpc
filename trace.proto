@@ -1,0 +1,165 @@
+syntax = "proto3";
+package trace;
+
+import "google/protobuf/timestamp.proto";
+
+// ═══════════════════════════════════════════
+//  Received header — one per hop
+// ═══════════════════════════════════════════
+//
+//  RFC 5321 §4.4: every MTA that handles a message MUST prepend
+//  a Received: header. These are read bottom-to-top (oldest first).
+//
+//  Format:
+//    Received: from sending.host (ip.addr)
+//              by receiving.host (software)
+//              with ESMTPS id queue-id
+//              for <recipient@domain>
+//              ; Thu, 12 Mar 2026 10:30:00 -0700
+
+message ReceivedHop {
+  // "from" clause: who handed the message to this hop
+  string from_hostname = 1;  // the EHLO/HELO identity
+  string from_address  = 2;  // actual IP/socket (TCP peer)
+  string from_rdns     = 3;  // reverse DNS of the IP (if available)
+
+  // "by" clause: this hop's identity
+  string by_hostname   = 1;  // receiving server's hostname
+  string by_software   = 2;  // "Postfix", "Microsoft SMTP Server", etc.
+
+  // "with" clause: protocol used
+  Protocol with         = 3;
+
+  // "id" clause: this hop's queue/transaction ID
+  string id = 4;
+
+  // "for" clause: envelope recipient (may be omitted for privacy)
+  string for_recipient = 5;
+
+  // Timestamp
+  google.protobuf.Timestamp timestamp = 6;
+
+  // TLS info (from extended Received headers)
+  string tls_version   = 7;
+  string tls_cipher    = 8;
+
+  enum Protocol {
+    SMTP      = 0;  // plain SMTP
+    ESMTP     = 1;  // EHLO-capable
+    ESMTPS    = 2;  // ESMTP + STARTTLS
+    ESMTPSA   = 3;  // ESMTP + STARTTLS + AUTH
+    LMTP      = 4;  // local delivery
+    HTTP      = 5;  // webmail submission
+    LOCAL     = 6;  // local injection (sendmail -t, etc.)
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Return-Path — set by the final delivery agent
+// ═══════════════════════════════════════════
+//
+//  RFC 5321 §4.4: The final delivery MTA (LMTP) sets Return-Path
+//  from the SMTP envelope sender (MAIL FROM).
+//  This is the ONLY authoritative record of the envelope sender
+//  once the SMTP transaction is complete.
+
+message ReturnPath {
+  string address = 1;  // the envelope sender (may be "" for DSNs)
+}
+
+// ═══════════════════════════════════════════
+//  Authentication-Results — RFC 8601
+// ═══════════════════════════════════════════
+//
+//  Stamped by the receiving MTA after running SPF/DKIM/DMARC/ARC.
+//  MUAs and downstream filters read this to know the auth outcome.
+//  The authserv-id scopes the header to prevent forgery from
+//  external sources — you only trust A-R headers from your own domain.
+
+message AuthenticationResultsHeader {
+  string authserv_id = 1;  // identity of the authenticating system
+
+  repeated MethodResult results = 2;
+}
+
+message MethodResult {
+  string method  = 1;  // "spf", "dkim", "dmarc", "arc", "iprev"
+  string result  = 2;  // "pass", "fail", "softfail", "neutral", "none", "temperror", "permerror"
+  string reason  = 3;  // human-readable detail
+
+  // Method-specific properties
+  map<string, string> properties = 4;
+  // SPF:  {"smtp.mailfrom": "sender@domain.com"}
+  // DKIM: {"header.d": "domain.com", "header.s": "selector", "header.i": "@domain.com"}
+  // DMARC: {"header.from": "domain.com", "policy": "reject"}
+}
+
+// ═══════════════════════════════════════════
+//  Complete message trace — reconstructed path
+// ═══════════════════════════════════════════
+
+message MessageTrace {
+  ReturnPath                  return_path = 1;
+  repeated ReceivedHop        hops        = 2;  // ordered: first = most recent, last = origin
+  AuthenticationResultsHeader auth_results = 3;
+
+  // Computed fields
+  google.protobuf.Duration total_transit_time = 4;  // first hop to last
+  uint32                   hop_count          = 5;
+  bool                     tls_all_hops       = 6;  // was TLS used throughout?
+
+  // Anomalies detected
+  repeated TraceAnomaly anomalies = 7;
+}
+
+message TraceAnomaly {
+  Type   type    = 1;
+  string detail  = 2;
+  uint32 hop     = 3;  // which hop (index into hops)
+
+  enum Type {
+    MISSING_RECEIVED     = 0;  // gap in the chain
+    TIMESTAMP_REGRESSION = 1;  // hop N has an earlier timestamp than hop N+1
+    FORGED_HEADER        = 2;  // Received header format inconsistent with claimed software
+    HOSTNAME_MISMATCH    = 3;  // EHLO name doesn't match rDNS
+    PRIVATE_IP_EXTERNAL  = 4;  // RFC 1918 address appearing in external hop
+    UNTRUSTED_AUTH_RESULTS = 5; // A-R header from outside the trust boundary
+    TLS_DOWNGRADE        = 6;  // a hop used plaintext after a prior hop used TLS
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service TraceService {
+  // Parse all Received: headers from a message into structured hops
+  rpc Parse(ParseRequest) returns (MessageTrace);
+
+  // Generate a Received: header for this hop (called by MTA during relay)
+  rpc Stamp(StampRequest) returns (StampResponse);
+
+  // Analyze a trace for anomalies and suspicious patterns
+  rpc Analyze(AnalyzeRequest) returns (AnalyzeResponse);
+}
+
+message ParseRequest {
+  bytes raw_message = 1;
+}
+
+message StampRequest {
+  ReceivedHop hop = 1;
+}
+
+message StampResponse {
+  string received_header = 1;  // the formatted Received: header to prepend
+}
+
+message AnalyzeRequest {
+  MessageTrace trace = 1;
+}
+
+message AnalyzeResponse {
+  repeated TraceAnomaly anomalies = 1;
+  double                risk_score = 2;  // 0.0 (clean) to 1.0 (suspicious)
+}
