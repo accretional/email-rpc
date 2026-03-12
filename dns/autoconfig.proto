@@ -1,0 +1,115 @@
+syntax = "proto3";
+package dns.autoconfig;
+
+// ═══════════════════════════════════════════
+//  The discovery result — what a client needs
+// ═══════════════════════════════════════════
+
+message MailConfig {
+  string                  domain   = 1;  // the email domain configured
+  repeated IncomingServer incoming = 2;  // IMAP/POP options, preference-ordered
+  repeated OutgoingServer outgoing = 3;  // submission/SMTP options
+  string                  display_name = 4;  // provider's human name
+}
+
+message IncomingServer {
+  Protocol protocol    = 1;
+  string   hostname    = 2;
+  uint32   port        = 3;
+  Security security    = 4;
+  AuthType auth        = 5;
+  string   username_template = 6;  // "%EMAILADDRESS%", "%EMAILLOCALPART%", etc.
+
+  enum Protocol {
+    IMAP = 0;
+    POP3 = 1;
+    JMAP = 2;
+  }
+}
+
+message OutgoingServer {
+  string   hostname    = 1;
+  uint32   port        = 2;  // 587 (STARTTLS) or 465 (implicit TLS)
+  Security security    = 3;
+  AuthType auth        = 4;
+  string   username_template = 5;
+}
+
+enum Security {
+  PLAIN    = 0;  // no encryption (port 143/110/25 — legacy, discouraged)
+  STARTTLS = 1;  // upgrade after connect (port 143/110/587)
+  TLS      = 2;  // implicit TLS (port 993/995/465)
+}
+
+enum AuthType {
+  PLAIN_AUTH     = 0;  // AUTH PLAIN / LOGIN
+  CRAM_MD5       = 1;  // challenge-response (legacy)
+  OAUTH2         = 2;  // XOAUTH2 / OAUTHBEARER
+  EXTERNAL       = 3;  // client cert
+}
+
+// ═══════════════════════════════════════════
+//  Discovery methods — tried in order
+// ═══════════════════════════════════════════
+//
+//  1. SRV records (RFC 6186):
+//       _imaps._tcp.example.com   → IMAP over TLS
+//       _imap._tcp.example.com    → IMAP STARTTLS
+//       _pop3s._tcp.example.com   → POP3 over TLS
+//       _submission._tcp.example.com → MSA
+//       _jmap._tcp.example.com    → JMAP
+//  2. Well-known URI:
+//       https://example.com/.well-known/autoconfig/mail/config-v1.1.xml
+//       (Mozilla autoconfig format)
+//  3. Mozilla ISPDB:
+//       https://autoconfig.thunderbird.net/v1.1/example.com
+//  4. Microsoft Autodiscover:
+//       https://autodiscover.example.com/autodiscover/autodiscover.xml
+//       (POX or JSON protocol)
+//  5. Guess common patterns:
+//       imap.example.com:993, smtp.example.com:587
+
+message SrvRecord {
+  uint32 priority = 1;
+  uint32 weight   = 2;
+  uint32 port     = 3;
+  string target   = 4;  // hostname
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service AutoconfigService {
+  // Full discovery: try all methods, return best config
+  rpc Discover(DiscoverRequest) returns (MailConfig);
+
+  // Individual discovery methods (for debugging/testing)
+  rpc LookupSrv(SrvLookupRequest) returns (SrvLookupResponse);
+  rpc FetchMozillaConfig(MozillaConfigRequest) returns (MailConfig);
+  rpc FetchAutodiscover(AutodiscoverRequest) returns (MailConfig);
+}
+
+message DiscoverRequest {
+  string email_address = 1;  // full address — domain is extracted
+}
+
+message SrvLookupRequest {
+  string domain = 1;
+}
+
+message SrvLookupResponse {
+  repeated SrvRecord imaps      = 1;
+  repeated SrvRecord imap       = 2;
+  repeated SrvRecord pop3s      = 3;
+  repeated SrvRecord submission = 4;
+  repeated SrvRecord jmap       = 5;
+}
+
+message MozillaConfigRequest {
+  string domain = 1;
+}
+
+message AutodiscoverRequest {
+  string email_address = 1;
+}
