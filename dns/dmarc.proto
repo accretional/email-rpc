@@ -1,0 +1,108 @@
+syntax = "proto3";
+package dns.dmarc;
+
+import "dns/spf.proto";
+import "dns/dkim.proto";
+
+// ═══════════════════════════════════════════
+//  DMARC record (_dmarc.domain TXT)
+// ═══════════════════════════════════════════
+
+message DmarcRecord {
+  string raw = 1;
+
+  // ── Policy ──
+  Policy policy            = 2;   // p=  what to do with failures from this domain
+  Policy subdomain_policy  = 3;   // sp= override for subdomains
+  uint32 percentage        = 4;   // pct= apply policy to this % of failing messages
+
+  // ── Alignment ──
+  //    This is the key DMARC concept: does the authenticated domain
+  //    match the From: header domain the human actually sees?
+  Alignment dkim_alignment = 5;   // adkim=
+  Alignment spf_alignment  = 6;   // aspf=
+
+  // ── Reporting ──
+  repeated string rua             = 7;   // aggregate report URIs (mailto: or https:)
+  repeated string ruf             = 8;   // forensic/failure report URIs
+  uint32          report_interval = 9;   // ri= seconds between aggregate reports
+  FailureOptions  failure_options = 10;  // fo= when to send forensic reports
+}
+
+enum Policy {
+  NONE       = 0;  // monitor: deliver normally, just send reports
+  QUARANTINE = 1;  // treat as suspicious (typically → spam folder)
+  REJECT     = 2;  // reject at SMTP level (553)
+}
+
+enum Alignment {
+  RELAXED = 0;  // organizational domain match: mail.example.com ≈ example.com
+  STRICT  = 1;  // exact domain match only
+}
+
+message FailureOptions {
+  bool on_all_fail  = 1;  // fo=0: report when ALL mechanisms fail (default)
+  bool on_any_fail  = 2;  // fo=1: report when ANY mechanism fails
+  bool on_dkim_fail = 3;  // fo=d: report on DKIM failure specifically
+  bool on_spf_fail  = 4;  // fo=s: report on SPF failure specifically
+}
+
+// ═══════════════════════════════════════════
+//  Evaluation result — the final authentication verdict
+// ═══════════════════════════════════════════
+//
+//  DMARC passes if AT LEAST ONE of these is true:
+//    1. SPF passes AND the MAIL FROM domain aligns with From: header
+//    2. DKIM passes AND the d= domain aligns with From: header
+//
+//  This is why you can have SPF pass but DMARC fail (forwarding breaks
+//  envelope alignment), and why DKIM is the more robust signal.
+
+message EvaluationResult {
+  Result result           = 1;
+  Policy effective_policy = 2;   // actual policy applied (after pct= sampling)
+  DmarcRecord record      = 3;
+
+  // ── Component results ──
+  dns.spf.CheckResult          spf_result   = 4;
+  repeated dns.dkim.VerifyResult dkim_results = 5;
+
+  // ── Alignment verdicts ──
+  //    These are what DMARC actually cares about.
+  //    SPF can "pass" but be "unaligned" (From: ≠ MAIL FROM domain).
+  bool spf_aligned  = 6;
+  bool dkim_aligned = 7;
+
+  string from_domain = 8;  // the RFC 5322 From: domain being protected
+
+  enum Result {
+    PASS      = 0;  // at least one mechanism passed AND aligned
+    FAIL      = 1;  // nothing passed with alignment
+    TEMPERROR = 2;
+    PERMERROR = 3;
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service DmarcService {
+  // Look up DMARC record for a domain
+  rpc Lookup(LookupRequest) returns (DmarcRecord);
+
+  // Full evaluation: orchestrate SPF + DKIM + alignment check.
+  // This is the top-level inbound authentication call.
+  rpc Evaluate(EvaluateRequest) returns (EvaluationResult);
+}
+
+message LookupRequest {
+  string domain = 1;  // looks up _dmarc.<domain> TXT record
+}
+
+message EvaluateRequest {
+  bytes  raw_message   = 1;  // received RFC 5322 message (for DKIM verify + From: parse)
+  string source_ip     = 2;  // connecting IP (for SPF)
+  string helo_domain   = 3;  // EHLO identity (for SPF)
+  string envelope_from = 4;  // MAIL FROM (for SPF + alignment)
+}
