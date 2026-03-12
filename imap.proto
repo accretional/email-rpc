@@ -1,0 +1,281 @@
+syntax = "proto3";
+package imap;
+
+import "google/protobuf/timestamp.proto";
+
+// ═══════════════════════════════════════════
+//  Mailbox — the protocol's unit of message storage
+// ═══════════════════════════════════════════
+
+// This is NOT a UX "folder." It's the fundamental IMAP container.
+// INBOX is mandatory per the RFC. Others exist at the server's discretion.
+message Mailbox {
+  string                name            = 1;  // "INBOX", "Sent", etc.
+  repeated MailboxAttribute attributes  = 2;
+  uint32                exists          = 3;  // total message count
+  uint32                recent          = 4;  // \Recent flag count
+  uint32                unseen          = 5;  // first unseen sequence number
+  uint32                uid_validity    = 6;  // epoch — if this changes, discard UID cache
+  uint32                uid_next        = 7;  // next UID that will be assigned
+  repeated string       permanent_flags = 8;  // flags the server will persist
+}
+
+enum MailboxAttribute {
+  NOINFERIORS    = 0;  // cannot have child mailboxes
+  NOSELECT       = 1;  // namespace node only, not selectable
+  MARKED         = 2;  // server hints: has interesting messages
+  UNMARKED       = 3;
+  HAS_CHILDREN   = 4;
+  HAS_NO_CHILDREN = 5;
+}
+
+// ═══════════════════════════════════════════
+//  Message addressing within IMAP
+// ═══════════════════════════════════════════
+
+// IMAP has two ways to reference messages:
+//   - sequence number: position in mailbox (1-based, volatile — shifts on expunge)
+//   - UID: unique within a uidvalidity epoch (stable, monotonically increasing)
+// UIDs are what clients should cache. Sequence numbers are for the protocol wire.
+message MessageRef {
+  oneof ref {
+    uint32 sequence_number = 1;
+    uint32 uid             = 2;
+  }
+}
+
+// ═══════════════════════════════════════════
+//  FETCH — IMAP's precision retrieval
+// ═══════════════════════════════════════════
+
+// You can ask for exactly what you need: just headers, just structure,
+// just part 1.2 of the MIME tree at bytes 0-4096.
+message FetchItems {
+  bool envelope       = 1;  // parsed header fields (From, Subject, Date, etc.)
+  bool body_structure = 2;  // MIME tree structure without content
+  bool flags          = 3;  // \Seen, \Answered, \Flagged, \Deleted, \Draft
+  bool internal_date  = 4;  // when the server received it
+  bool rfc822_size    = 5;  // message size in octets
+
+  repeated BodySection sections = 6;  // selective content fetch
+}
+
+message BodySection {
+  string section = 1;   // MIME part path: "" (whole), "1.2", "HEADER", "TEXT", "HEADER.FIELDS (Subject From)"
+  uint32 offset  = 2;   // byte offset for partial fetch
+  uint32 length  = 3;   // byte count (0 = all remaining)
+  bool   peek    = 4;   // BODY.PEEK[]: fetch WITHOUT setting \Seen flag
+}
+
+// ── Fetched message data ──
+
+message FetchedMessage {
+  MessageRef                      ref            = 1;
+  Envelope                        envelope       = 2;
+  BodyStructure                   body_structure = 3;
+  repeated string                 flags          = 4;
+  google.protobuf.Timestamp       internal_date  = 5;
+  uint32                          size           = 6;
+  repeated FetchedSection         sections       = 7;
+}
+
+// RFC 2822 envelope — the structured header parse
+message Envelope {
+  google.protobuf.Timestamp date      = 1;
+  string                    subject   = 2;
+  repeated Address          from      = 3;
+  repeated Address          sender    = 4;
+  repeated Address          reply_to  = 5;
+  repeated Address          to        = 6;
+  repeated Address          cc        = 7;
+  repeated Address          bcc       = 8;
+  string                    in_reply_to = 9;
+  string                    message_id  = 10;
+}
+
+message Address {
+  string name    = 1;  // display name
+  string mailbox = 2;  // local-part
+  string host    = 3;  // domain
+}
+
+// ── BODYSTRUCTURE — recursive MIME tree ──
+
+message BodyStructure {
+  oneof structure {
+    SinglePart single = 1;
+    MultiPart  multi  = 2;
+  }
+}
+
+message SinglePart {
+  string              type       = 1;   // "text", "image", "application"
+  string              subtype    = 2;   // "plain", "png", "pdf"
+  map<string, string> parameters = 3;   // charset, name, etc.
+  string              content_id = 4;
+  string              encoding   = 5;   // base64, quoted-printable, 7bit
+  uint32              size       = 6;   // octets
+  uint32              lines      = 7;   // line count (text/* types only)
+  string              disposition = 8;  // inline | attachment
+}
+
+message MultiPart {
+  repeated BodyStructure parts   = 1;
+  string                 subtype = 2;  // mixed, alternative, related
+}
+
+message FetchedSection {
+  string section = 1;
+  bytes  data    = 2;
+}
+
+// ═══════════════════════════════════════════
+//  SEARCH — server-side filtering
+// ═══════════════════════════════════════════
+
+message SearchCriteria {
+  oneof criterion {
+    // Flags
+    bool   seen     = 1;
+    bool   answered = 2;
+    bool   flagged  = 3;
+    bool   deleted  = 4;
+
+    // Dates
+    google.protobuf.Timestamp since  = 5;
+    google.protobuf.Timestamp before = 6;
+
+    // Headers
+    HeaderSearch header  = 7;
+    string       subject = 8;
+    string       from    = 9;
+    string       to      = 10;
+
+    // Content (full-text server-side search)
+    string body = 11;
+    string text = 12;  // headers + body
+
+    // Size
+    uint32 larger  = 13;
+    uint32 smaller = 14;
+
+    // Logical combinators
+    SearchGroup and = 15;
+    SearchGroup or  = 16;
+    SearchCriteria not = 17;
+
+    // UID set expression
+    string uid_set = 18;  // "1:100", "5,8,12:*"
+  }
+}
+
+message HeaderSearch {
+  string name  = 1;
+  string value = 2;
+}
+
+message SearchGroup {
+  repeated SearchCriteria criteria = 1;
+}
+
+// ═══════════════════════════════════════════
+//  STORE — flag mutation
+// ═══════════════════════════════════════════
+
+message StoreRequest {
+  string          set       = 1;  // message set: "1:*", "5,10:15"
+  bool            use_uid   = 2;
+  FlagOperation   operation = 3;
+  repeated string flags     = 4;  // "\\Seen", "\\Flagged", "$Important", etc.
+  bool            silent    = 5;  // .SILENT variant: don't return updated flags
+
+  enum FlagOperation {
+    SET    = 0;  // replace
+    ADD    = 1;  // +FLAGS
+    REMOVE = 2;  // -FLAGS
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service ImapService {
+  // ── Connection ──
+  rpc Authenticate(AuthRequest) returns (AuthResponse);
+
+  // ── Mailbox operations ──
+  rpc ListMailboxes(ListRequest) returns (ListResponse);
+  rpc Select(SelectRequest) returns (Mailbox);         // read-write
+  rpc Examine(SelectRequest) returns (Mailbox);        // read-only
+
+  // ── Message operations ──
+  rpc Fetch(ImapFetchRequest) returns (stream FetchedMessage);
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc Store(StoreRequest) returns (StoreResponse);
+  rpc Copy(CopyMoveRequest) returns (CopyMoveResponse);
+  rpc Move(CopyMoveRequest) returns (CopyMoveResponse);
+  rpc Expunge(ExpungeRequest) returns (ExpungeResponse);
+
+  // ── IDLE — server push for real-time updates ──
+  rpc Idle(IdleRequest) returns (stream MailboxEvent);
+}
+
+message AuthRequest {
+  string host = 1;
+  uint32 port = 2;  // 993 (implicit TLS) or 143 (STARTTLS)
+  oneof credentials {
+    PlainCredentials plain  = 3;
+    OAuthToken       oauth  = 4;
+  }
+}
+
+message PlainCredentials { string username = 1; string password = 2; }
+message OAuthToken       { string token = 1; }
+
+message AuthResponse {
+  bool            success      = 1;
+  repeated string capabilities = 2;  // IMAP4rev2, IDLE, MOVE, CONDSTORE, etc.
+}
+
+message ListRequest {
+  string reference = 1;  // starting namespace ("" for root)
+  string pattern   = 2;  // "*" for recursive, "%" for top-level only
+}
+message ListResponse          { repeated Mailbox mailboxes = 1; }
+message SelectRequest         { string mailbox = 1; }
+
+message ImapFetchRequest {
+  string     set     = 1;  // "1:*", "1,3,5:10"
+  bool       use_uid = 2;  // interpret set as UIDs
+  FetchItems items   = 3;
+}
+
+message SearchRequest {
+  SearchCriteria criteria    = 1;
+  bool           return_uids = 2;
+}
+message SearchResponse   { repeated uint32 ids = 1; }
+
+message StoreResponse    { repeated FetchedMessage updated = 1; }
+
+message CopyMoveRequest {
+  string set         = 1;
+  bool   use_uid     = 2;
+  string destination = 3;  // target mailbox name
+}
+message CopyMoveResponse { map<uint32, uint32> uid_mapping = 1; }
+
+message ExpungeRequest  {}
+message ExpungeResponse { repeated uint32 expunged_sequences = 1; }
+
+message IdleRequest { string mailbox = 1; }
+
+// ── Server push events during IDLE ──
+message MailboxEvent {
+  oneof event {
+    uint32         exists  = 1;  // new message count
+    uint32         expunge = 2;  // sequence number removed
+    FetchedMessage update  = 3;  // unsolicited flag change
+  }
+}
