@@ -1,0 +1,82 @@
+syntax = "proto3";
+package eai;
+
+// ═══════════════════════════════════════════
+//  Internationalized email address
+// ═══════════════════════════════════════════
+//
+//  Traditional:  alice@example.com     (ASCII only, RFC 5321)
+//  EAI:          用户@例え.jp           (UTF-8 everywhere, RFC 6531)
+//  IDN:          alice@münchen.de      (Unicode domain, ASCII local)
+//
+//  The domain side uses IDNA2008 (RFC 5891):
+//    münchen.de → xn--mnchen-3ya.de (A-label / punycode)
+//  The local-part has no ASCII fallback — it's UTF-8 or nothing.
+
+message InternationalAddress {
+  string local_part  = 1;  // UTF-8 local-part ("用户")
+  string domain      = 2;  // UTF-8 domain ("例え.jp")
+
+  // Derived forms
+  string a_label_domain   = 3;  // punycode: "xn--r8jz45g.jp"
+  string ascii_address     = 4;  // full ASCII form if possible, empty if not
+  bool   requires_smtputf8 = 5;  // true if local-part is non-ASCII
+
+  // Validation results
+  bool   valid_local_part = 6;
+  bool   valid_domain     = 7;
+}
+
+// ═══════════════════════════════════════════
+//  IDNA — domain name internationalization
+// ═══════════════════════════════════════════
+
+message IdnaConversion {
+  string unicode_label  = 1;  // "münchen"
+  string ascii_label    = 2;  // "xn--mnchen-3ya"  (A-label)
+  bool   valid          = 3;
+  string error          = 4;  // IDNA2008 validation error if invalid
+
+  // IDNA2008 vs IDNA2003 differences for this label
+  // Some characters (ß, ς, ZWJ) behave differently between versions
+  bool   idna2003_differs = 5;
+}
+
+// ═══════════════════════════════════════════
+//  SMTP compatibility — RFC 6531
+// ═══════════════════════════════════════════
+//
+//  SMTPUTF8 is an SMTP extension. If the receiving server doesn't
+//  advertise it, you CANNOT send messages with non-ASCII addresses.
+//  This is a real interoperability problem.
+
+message SmtpUtf8Capability {
+  bool   supported         = 1;  // did the server advertise SMTPUTF8?
+  // If not supported and the message requires it:
+  //   - Bounce with 553 5.6.7 "non-ASCII addresses not permitted"
+  //   - Or attempt downgrade (see DowngradeResult)
+}
+
+// RFC 6857: downgrade mechanisms for gateways to non-EAI systems
+message DowngradeResult {
+  bool   downgraded        = 1;
+  bool   information_lost  = 2;  // display names preserved but addresses may be munged
+
+  // What was modified
+  repeated DowngradedHeader headers = 3;
+}
+
+message DowngradedHeader {
+  string original_name  = 1;  // "From"
+  string original_value = 2;  // "用户 <用户@例え.jp>"
+  string downgraded_name  = 3;  // "Downgraded-From" (preserved as encoded-word)
+  string downgraded_value = 4;  // RFC 2047 encoded fallback
+}
+
+// ═══════════════════════════════════════════
+//  MIME compatibility — RFC 6532
+// ═══════════════════════════════════════════
+//
+//  Internationalized messages use:
+//    MIME-Version: 1.0
+//
