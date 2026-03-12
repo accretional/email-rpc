@@ -1,0 +1,68 @@
+syntax = "proto3";
+package mime;
+
+import "mail.proto";
+
+// ═══════════════════════════════════════════
+//  MIME structure — recursive entity tree
+// ═══════════════════════════════════════════
+
+message Entity {
+  ContentType content_type              = 1;
+  string      content_transfer_encoding = 2;  // 7bit | quoted-printable | base64
+  string      content_disposition       = 3;  // inline | attachment
+  string      content_id                = 4;  // for multipart/related cross-refs
+
+  oneof payload {
+    bytes     body      = 5;  // leaf: actual content
+    Multipart multipart = 6;  // branch: nested parts
+  }
+
+  repeated Header headers = 7;  // part-level headers
+}
+
+message ContentType {
+  string              type    = 1;  // "text", "multipart", "application"
+  string              subtype = 2;  // "plain", "mixed", "alternative"
+  map<string, string> params  = 3;  // charset, boundary, name, etc.
+}
+
+message Multipart {
+  repeated Entity parts    = 1;
+  string          boundary = 2;  // MIME boundary delimiter
+}
+
+message Header {
+  string name  = 1;
+  string value = 2;  // raw value, possibly RFC 2047 encoded-word
+}
+
+// ═══════════════════════════════════════════
+//  Codec service
+// ═══════════════════════════════════════════
+
+service MimeCodec {
+  // mail.Message → RFC 5322 bytes (for SMTP DATA)
+  rpc Encode(EncodeRequest) returns (EncodeResponse);
+
+  // RFC 5322 bytes → mail.Message (from IMAP FETCH / POP RETR)
+  rpc Decode(DecodeRequest) returns (DecodeResponse);
+}
+
+message EncodeRequest {
+  mail.Message message = 1;
+}
+
+message EncodeResponse {
+  bytes  raw        = 1;  // complete RFC 5322 message bytes
+  Entity structured = 2;  // the MIME tree (for inspection/debugging)
+}
+
+message DecodeRequest {
+  bytes raw = 1;
+}
+
+message DecodeResponse {
+  mail.Message message    = 1;  // clean extracted model
+  Entity       structured = 2;  // full MIME tree with all parts
+}
