@@ -1,0 +1,145 @@
+syntax = "proto3";
+package smtp;
+
+import "google/protobuf/duration.proto";
+
+// ═══════════════════════════════════════════
+//  The Envelope — what SMTP actually routes on
+// ═══════════════════════════════════════════
+
+// This is fundamentally distinct from message headers (From:/To:).
+// The envelope exists only during SMTP transactions and in trace headers.
+message Envelope {
+  string          mail_from = 1;  // envelope sender ("" for bounce messages / DSNs)
+  repeated string rcpt_to   = 2;  // envelope recipients
+}
+
+// ═══════════════════════════════════════════
+//  Session & capabilities
+// ═══════════════════════════════════════════
+
+message Session {
+  string           id          = 1;
+  string           client_host = 2;
+  string           server_host = 3;
+  uint32           server_port = 4;  // 25 (MTA↔MTA), 587 (submission), 465 (implicit TLS)
+  EhloCapabilities capabilities = 5;
+  TlsInfo          tls         = 6;
+  AuthInfo         auth        = 7;
+}
+
+message EhloCapabilities {
+  bool             starttls        = 1;
+  bool             eight_bit_mime  = 2;  // 8BITMIME extension
+  bool             pipelining      = 3;  // batch commands without waiting
+  bool             chunking        = 4;  // BDAT as alternative to DATA
+  uint64           max_size        = 5;  // SIZE extension — max message octets
+  repeated string  auth_mechanisms = 6;  // PLAIN, LOGIN, XOAUTH2, etc.
+  bool             smtputf8        = 7;  // RFC 6531 internationalized addresses
+  bool             dsn             = 8;  // delivery status notifications
+}
+
+message TlsInfo {
+  bool   active               = 1;
+  string protocol_version     = 2;  // "TLS 1.3"
+  string cipher_suite         = 3;
+  bool   certificate_verified = 4;
+}
+
+message AuthInfo {
+  string mechanism     = 1;  // PLAIN, XOAUTH2, etc.
+  string identity      = 2;  // authenticated identity
+  bool   authenticated = 3;
+}
+
+// ═══════════════════════════════════════════
+//  Transaction results & bounces
+// ═══════════════════════════════════════════
+
+message TransactionResult {
+  string   recipient       = 1;
+  uint32   reply_code      = 2;  // 250, 451, 550, etc.
+  string   enhanced_status = 3;  // RFC 3463: "2.1.5", "5.1.1"
+  string   reply_text      = 4;
+  Category category        = 5;
+
+  enum Category {
+    SUCCESS   = 0;  // 2xx — delivered
+    TRANSIENT = 1;  // 4xx — try again later (greylisting, rate limit, etc.)
+    PERMANENT = 2;  // 5xx — give up (user unknown, policy rejection, etc.)
+  }
+}
+
+// RFC 3464: Delivery Status Notification (the structured bounce)
+message DSN {
+  string reporting_mta                = 1;
+  string original_envelope_id         = 2;
+  google.protobuf.Timestamp arrival   = 3;
+  repeated RecipientDSN    recipients = 4;
+  bytes original_message              = 5;  // returned content (partial or full)
+}
+
+message RecipientDSN {
+  string original_recipient = 1;
+  string final_recipient    = 2;
+  string action             = 3;  // failed | delayed | delivered | relayed | expanded
+  string status             = 4;  // enhanced status code
+  string diagnostic_code    = 5;  // "smtp; 550 5.1.1 User unknown"
+  string remote_mta         = 6;  // which MTA reported this
+}
+
+// ═══════════════════════════════════════════
+//  Service — two levels of abstraction
+// ═══════════════════════════════════════════
+
+service SmtpService {
+  // High-level: complete delivery (connect, TLS, auth, send, get result)
+  rpc Deliver(DeliverRequest) returns (DeliverResponse);
+
+  // Low-level: raw SMTP command/reply stream for custom flows
+  rpc Transact(stream SmtpCommand) returns (stream SmtpReply);
+}
+
+message DeliverRequest {
+  Envelope        envelope = 1;
+  bytes           message  = 2;  // RFC 5322 encoded (from MimeCodec.Encode)
+  DeliveryOptions options  = 3;
+}
+
+message DeliveryOptions {
+  bool                      require_tls = 1;
+  google.protobuf.Duration  timeout     = 2;
+  uint32                    max_retries = 3;
+  bool                      request_dsn = 4;
+}
+
+message DeliverResponse {
+  repeated TransactionResult results = 1;  // one per RCPT TO
+  Session                    session = 2;  // connection details for diagnostics
+}
+
+// ── Low-level command/reply stream ──
+
+message SmtpCommand {
+  oneof command {
+    string          ehlo      = 1;   // EHLO hostname
+    bool            starttls  = 2;   // upgrade to TLS
+    AuthCredentials auth      = 3;   // AUTH mechanism + creds
+    string          mail_from = 4;   // MAIL FROM:<addr>
+    string          rcpt_to   = 5;   // RCPT TO:<addr>
+    bytes           data      = 6;   // DATA + message content
+    bool            rset      = 7;   // reset transaction
+    bool            quit      = 8;   // close connection
+  }
+}
+
+message AuthCredentials {
+  string mechanism   = 1;
+  bytes  credentials = 2;  // mechanism-specific (PLAIN: \0user\0pass, etc.)
+}
+
+message SmtpReply {
+  uint32 code            = 1;  // 220, 250, 354, 421, 550, etc.
+  string enhanced_status = 2;
+  string text            = 3;
+}
