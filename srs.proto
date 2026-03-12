@@ -1,0 +1,96 @@
+syntax = "proto3";
+package srs;
+
+// ═══════════════════════════════════════════
+//  SRS address format
+// ═══════════════════════════════════════════
+//
+//  The problem:
+//    alice@original.com → forwards via relay.net → arrives at gmail.com
+//    MAIL FROM is still alice@original.com
+//    Gmail checks SPF for original.com → relay.net's IP isn't listed → FAIL
+//
+//  The fix:
+//    relay.net rewrites MAIL FROM to: SRS0=HHH=TT=original.com=alice@relay.net
+//    Now SPF checks relay.net → relay.net's IP IS listed → PASS
+//    Bounces go to relay.net, which reverses SRS to bounce to alice@original.com
+//
+//  SRS0 = first hop rewrite
+//  SRS1 = subsequent hops (rewrites a previous SRS0 address to avoid nesting)
+
+message SrsAddress {
+  Scheme  scheme            = 1;
+  string  hash              = 2;  // HMAC truncated (anti-forgery)
+  string  timestamp         = 3;  // encoded as two base-32 chars (day resolution)
+  string  original_domain   = 4;
+  string  original_local    = 5;
+  string  forwarder_domain  = 6;  // the domain doing the rewriting
+
+  enum Scheme {
+    SRS0 = 0;  // SRS0=HHH=TT=domain=local@forwarder
+    SRS1 = 1;  // SRS1=HHH=relay.net==HHH=TT=domain=local@forwarder
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Rewriting configuration
+// ═══════════════════════════════════════════
+
+message SrsConfig {
+  // HMAC secret for signing/verifying SRS addresses
+  // Rotate these — support multiple active secrets for rollover
+  repeated bytes secrets          = 1;  // first = current signing key, rest = verification
+  uint32         hash_length      = 2;  // truncation length (typical: 4 chars)
+  uint32         max_age_days     = 3;  // reject SRS addresses older than this (typical: 21)
+  string         forwarder_domain = 4;  // the domain to use as the rewrite target
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service SrsService {
+  // Rewrite a sender address for forwarding (used by the forwarder MTA)
+  rpc Rewrite(RewriteRequest) returns (RewriteResponse);
+
+  // Reverse an SRS address back to the original (for bounce processing)
+  rpc Reverse(ReverseRequest) returns (ReverseResponse);
+
+  // Validate an SRS address (check HMAC + timestamp)
+  rpc Validate(ValidateRequest) returns (ValidateResponse);
+}
+
+message RewriteRequest {
+  string original_address = 1;  // "alice@original.com"
+  // If the address is already SRS0, this produces SRS1 to avoid nesting
+}
+
+message RewriteResponse {
+  string rewritten_address = 1;  // "SRS0=HHH=TT=original.com=alice@relay.net"
+  SrsAddress parsed        = 2;
+}
+
+message ReverseRequest {
+  string srs_address = 1;  // "SRS0=HHH=TT=original.com=alice@relay.net"
+}
+
+message ReverseResponse {
+  bool   valid            = 1;
+  string original_address = 2;  // "alice@original.com"
+  string failure_reason   = 3;  // if invalid: "hash mismatch", "expired", "malformed"
+}
+
+message ValidateRequest {
+  string srs_address = 1;
+}
+
+message ValidateResponse {
+  bool       valid      = 1;
+  SrsAddress parsed     = 2;
+  string     reason     = 3;
+
+  // Specific validation results
+  bool hash_valid      = 4;  // HMAC verified against any active secret
+  bool timestamp_valid = 5;  // within max_age_days
+  bool format_valid    = 6;  // correctly structured
+}
