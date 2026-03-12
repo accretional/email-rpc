@@ -1,0 +1,147 @@
+syntax = "proto3";
+package lmtp;
+
+import "smtp.proto";
+
+// ═══════════════════════════════════════════
+//  LMTP vs SMTP — the key differences
+// ═══════════════════════════════════════════
+//
+//  SMTP: one reply after DATA, covering the entire transaction.
+//        If the MTA accepts, it takes responsibility for delivery.
+//
+//  LMTP: N replies after DATA (one per RCPT TO).
+//        Each recipient independently succeeds or fails.
+//        No queuing — the caller (MTA) retains responsibility.
+//
+//  This means LMTP can report:
+//    - "alice: 250 delivered to mailbox"
+//    - "bob: 452 mailbox full"
+//    - "charlie: 550 no such user"
+//  ...all for the same message in the same transaction.
+//
+//  Wire protocol: identical to SMTP except:
+//    - LHLO instead of EHLO
+//    - Multiple responses after final DATA "."
+//    - No queuing guarantee
+
+message LmtpSession {
+  string client_host = 1;  // the MTA connecting
+  string server_host = 2;  // the message store (Dovecot, Cyrus, etc.)
+  string socket_path = 3;  // LMTP often runs over Unix sockets, not TCP
+  uint32 port        = 4;  // if TCP (typically 24)
+
+  LhloCapabilities capabilities = 5;
+}
+
+message LhloCapabilities {
+  // Mostly mirrors EHLO but the set differs in practice
+  bool             eight_bit_mime = 1;
+  bool             pipelining     = 2;
+  bool             chunking       = 3;
+  uint64           max_size       = 4;
+  bool             smtputf8       = 5;
+  bool             enhance_status = 6;  // enhanced status codes (RFC 2034)
+}
+
+// ═══════════════════════════════════════════
+//  Per-recipient delivery result
+// ═══════════════════════════════════════════
+//
+//  This is the entire point of LMTP: each recipient gets
+//  their own result AFTER the message content is transmitted.
+//  The MTA uses these to decide what to bounce, retry, or confirm.
+
+message RecipientDeliveryResult {
+  string recipient       = 1;  // the RCPT TO address
+  uint32 reply_code      = 2;  // 250 (delivered), 452 (full), 550 (no user), etc.
+  string enhanced_status = 3;  // "2.1.5", "4.2.2", "5.1.1"
+  string reply_text      = 4;
+  Outcome outcome        = 5;
+
+  enum Outcome {
+    DELIVERED = 0;  // 2xx — written to mailbox
+    TEMPFAIL  = 1;  // 4xx — MTA should retry (quota, I/O error, etc.)
+    PERMFAIL  = 2;  // 5xx — MTA should bounce (no such user, policy, etc.)
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Delivery hooks — what happens at the message store
+// ═══════════════════════════════════════════
+//
+//  When LMTP accepts a message, the message store typically:
+//    1. Runs Sieve scripts (server-side filtering)
+//    2. Performs duplicate detection (Message-ID dedup)
+//    3. Assigns IMAP UID + updates mailbox state
+//    4. Triggers IMAP IDLE notifications
+//    5. Fires push notifications (JMAP push, etc.)
+
+message DeliveryMetadata {
+  string  recipient      = 1;
+  string  mailbox        = 2;  // target mailbox after Sieve ("INBOX", "Junk", etc.)
+  uint32  assigned_uid   = 3;  // IMAP UID assigned
+  uint32  uid_validity   = 4;  // for the target mailbox
+  bool    sieve_executed = 5;  // was a Sieve script active?
+  string  sieve_action   = 6;  // "keep", "fileinto Junk", "redirect ...", "discard"
+  bool    duplicate      = 7;  // Message-ID already in mailbox (deduplicated)
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service LmtpService {
+  // Deliver a message to local recipients
+  // Returns per-recipient results (the core LMTP contract)
+  rpc Deliver(LmtpDeliverRequest) returns (LmtpDeliverResponse);
+
+  // Low-level: stream the LMTP transaction (LHLO, MAIL FROM, RCPT TO, DATA)
+  // Mirrors the SmtpService.Transact pattern
+  rpc Transact(stream LmtpCommand) returns (stream LmtpReply);
+}
+
+message LmtpDeliverRequest {
+  string          envelope_from = 1;
+  repeated string recipients    = 2;  // local recipients
+  bytes           message       = 3;  // RFC 5322 encoded
+
+  // Auth context passed from the MTA (for Sieve, policy, logging)
+  InboundContext  context = 4;
+}
+
+message InboundContext {
+  string source_ip                   = 1;
+  string helo_domain                 = 2;
+  string authentication_results      = 3;  // the A-R header from inbound auth
+  string dmarc_disposition           = 4;  // "none", "quarantine", "reject"
+  bool   spam_flagged                = 5;  // upstream scanner's verdict
+  double spam_score                  = 6;
+}
+
+message LmtpDeliverResponse {
+  repeated RecipientDeliveryResult results  = 1;  // one per recipient
+  repeated DeliveryMetadata        metadata = 2;  // details for successful deliveries
+  LmtpSession                      session  = 3;
+}
+
+// ── Low-level command/reply stream ──
+
+message LmtpCommand {
+  oneof command {
+    string lhlo       = 1;  // LHLO hostname (NOT EHLO)
+    string mail_from  = 2;
+    string rcpt_to    = 3;
+    bytes  data       = 4;
+    bool   rset       = 5;
+    bool   quit       = 6;
+  }
+}
+
+message LmtpReply {
+  uint32 code            = 1;
+  string enhanced_status = 2;
+  string text            = 3;
+  // For post-DATA replies, which recipient this corresponds to
+  string recipient       = 4;
+}
