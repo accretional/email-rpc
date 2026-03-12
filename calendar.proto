@@ -1,0 +1,165 @@
+syntax = "proto3";
+package calendar;
+
+import "google/protobuf/timestamp.proto";
+import "mail.proto";
+
+// ═══════════════════════════════════════════
+//  iCalendar event (simplified essential model)
+// ═══════════════════════════════════════════
+
+message Event {
+  string uid         = 1;  // globally unique event identifier
+  uint32 sequence    = 2;  // increments on each update
+  string summary     = 3;  // event title
+  string description = 4;
+  string location    = 5;
+
+  google.protobuf.Timestamp dtstart = 6;
+  google.protobuf.Timestamp dtend   = 7;
+  string                    tzid    = 8;  // IANA timezone: "America/New_York"
+
+  Organizer          organizer   = 9;
+  repeated Attendee  attendees   = 10;
+  RecurrenceRule     rrule       = 11;  // optional recurrence
+
+  Status status = 12;
+
+  enum Status {
+    TENTATIVE  = 0;
+    CONFIRMED  = 1;
+    CANCELLED  = 2;
+  }
+}
+
+message Organizer {
+  string email        = 1;
+  string display_name = 2;
+}
+
+message Attendee {
+  string          email        = 1;
+  string          display_name = 2;
+  Role            role         = 3;
+  ParticipationStatus rsvp     = 4;
+  bool            rsvp_requested = 5;
+
+  enum Role {
+    REQUIRED = 0;  // REQ-PARTICIPANT
+    OPTIONAL = 1;  // OPT-PARTICIPANT
+    NON_PARTICIPANT = 2;
+    CHAIR    = 3;
+  }
+
+  enum ParticipationStatus {
+    NEEDS_ACTION = 0;
+    ACCEPTED     = 1;
+    DECLINED     = 2;
+    TENTATIVE    = 3;
+    DELEGATED    = 4;
+  }
+}
+
+// Simplified — full RRULE is a complex beast
+message RecurrenceRule {
+  Frequency frequency = 1;
+  uint32    interval  = 2;  // every N <frequency> units
+  uint32    count     = 3;  // stop after N occurrences (0 = no limit)
+  google.protobuf.Timestamp until = 4;  // stop after this date
+  repeated uint32 by_day     = 5;  // 0=SU, 1=MO, ..., 6=SA
+  repeated uint32 by_month   = 6;  // 1-12
+  repeated uint32 by_monthday = 7; // 1-31
+
+  enum Frequency {
+    DAILY   = 0;
+    WEEKLY  = 1;
+    MONTHLY = 2;
+    YEARLY  = 3;
+  }
+}
+
+// ═══════════════════════════════════════════
+//  iTIP methods — the scheduling protocol
+// ═══════════════════════════════════════════
+//
+//  When carried over email (iMIP / RFC 6047), each of these
+//  becomes a text/calendar MIME part with METHOD:<method>.
+//
+//  The state machine:
+//    Organizer → REQUEST → Attendees
+//    Attendees → REPLY (ACCEPTED/DECLINED/TENTATIVE) → Organizer
+//    Organizer → CANCEL → Attendees
+//    Organizer → REQUEST (updated sequence) → Attendees  (reschedule)
+//    Attendee  → COUNTER → Organizer  (propose new time)
+//    Organizer → DECLINECOUNTER → Attendee
+
+message SchedulingMessage {
+  Method method = 1;
+  Event  event  = 2;
+
+  enum Method {
+    PUBLISH        = 0;  // informational (no RSVP expected)
+    REQUEST        = 1;  // invitation or update
+    REPLY          = 2;  // attendee's RSVP
+    CANCEL         = 3;  // organizer cancels
+    COUNTER        = 4;  // attendee proposes alternative
+    DECLINE_COUNTER = 5;  // organizer rejects the counter
+    ADD            = 6;   // add instances to recurring event
+    REFRESH        = 7;   // request an updated copy
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service CalendarService {
+  // Generate an invitation email (REQUEST)
+  rpc CreateInvitation(CreateInvitationRequest) returns (CreateInvitationResponse);
+
+  // Generate a reply email (REPLY)
+  rpc CreateReply(CreateReplyRequest) returns (CreateReplyResponse);
+
+  // Generate a cancellation (CANCEL)
+  rpc CreateCancellation(CancelRequest) returns (CancelResponse);
+
+  // Parse a received text/calendar part
+  rpc Parse(ParseRequest) returns (SchedulingMessage);
+}
+
+message CreateInvitationRequest {
+  Event event = 1;
+}
+
+message CreateInvitationResponse {
+  mail.Message message       = 1;  // ready-to-send email with text/calendar attachment
+  string       icalendar_raw = 2;  // the raw .ics content
+}
+
+message CreateReplyRequest {
+  string          event_uid = 1;
+  string          attendee_email = 2;
+  Attendee.ParticipationStatus status = 3;
+  string          comment = 4;  // optional message
+  // The original invitation's iCalendar (needed to construct the reply)
+  string          original_icalendar = 5;
+}
+
+message CreateReplyResponse {
+  mail.Message message       = 1;
+  string       icalendar_raw = 2;
+}
+
+message CancelRequest {
+  Event  event   = 1;  // with incremented sequence
+  string comment = 2;
+}
+
+message CancelResponse {
+  mail.Message message       = 1;
+  string       icalendar_raw = 2;
+}
+
+message ParseRequest {
+  bytes mime_part = 1;  // the text/calendar MIME part content
+}
