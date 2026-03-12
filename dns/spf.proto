@@ -1,0 +1,89 @@
+syntax = "proto3";
+package dns.spf;
+
+// ═══════════════════════════════════════════
+//  SPF record structure
+// ═══════════════════════════════════════════
+
+message SpfRecord {
+  string             raw        = 1;  // raw TXT value: "v=spf1 include:..."
+  repeated Directive directives = 2;  // parsed, ordered
+  string             redirect   = 3;  // redirect= modifier (delegate to another domain)
+  string             explanation = 4; // exp= modifier domain (for rejection messages)
+}
+
+message Directive {
+  Qualifier qualifier = 1;
+  Mechanism mechanism = 2;
+}
+
+// The qualifier determines what happens when a mechanism matches
+enum Qualifier {
+  PASS     = 0;  // + (default if omitted)
+  FAIL     = 1;  // -
+  SOFTFAIL = 2;  // ~
+  NEUTRAL  = 3;  // ?
+}
+
+// Mechanisms are evaluated left-to-right, first match wins
+message Mechanism {
+  oneof mechanism {
+    AllMechanism     all     = 1;  // matches everything (usually last: ~all, -all)
+    Ip4Mechanism     ip4     = 2;  // match by IPv4 CIDR
+    Ip6Mechanism     ip6     = 3;  // match by IPv6 CIDR
+    AMechanism       a       = 4;  // match if IP is in domain's A records
+    MxMechanism      mx      = 5;  // match if IP is one of domain's MX hosts
+    IncludeMechanism include = 6;  // recursively evaluate another domain's SPF
+    ExistsMechanism  exists  = 7;  // match if a DNS A record exists
+  }
+}
+
+message AllMechanism     {}
+message Ip4Mechanism     { string cidr   = 1; }  // "192.168.0.0/16"
+message Ip6Mechanism     { string cidr   = 1; }
+message AMechanism       { string domain = 1; uint32 prefix_v4 = 2; uint32 prefix_v6 = 3; }
+message MxMechanism      { string domain = 1; uint32 prefix_v4 = 2; uint32 prefix_v6 = 3; }
+message IncludeMechanism { string domain = 1; }
+message ExistsMechanism  { string domain = 1; }  // macro-expanded domain
+
+// ═══════════════════════════════════════════
+//  Evaluation result (RFC 7208 §2.6)
+// ═══════════════════════════════════════════
+
+message CheckResult {
+  Result result           = 1;
+  string explanation      = 2;  // human-readable (from exp= modifier)
+  string authority_domain = 3;  // the domain whose policy was evaluated
+
+  enum Result {
+    NONE      = 0;  // no SPF record found
+    NEUTRAL   = 1;  // explicit "?" — no assertion
+    PASS      = 2;  // IP is authorized
+    FAIL      = 3;  // IP is explicitly NOT authorized
+    SOFTFAIL  = 4;  // probably not authorized (transitional)
+    TEMPERROR = 5;  // DNS timeout or transient failure
+    PERMERROR = 6;  // malformed record, too many lookups, etc.
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service SpfService {
+  // Parse and return the SPF record for a domain
+  rpc Lookup(LookupRequest) returns (SpfRecord);
+
+  // Full evaluation: is this IP authorized to send for this domain?
+  rpc Check(CheckRequest) returns (CheckResult);
+}
+
+message LookupRequest {
+  string domain = 1;
+}
+
+message CheckRequest {
+  string ip          = 1;  // sending server's IP
+  string sender      = 2;  // MAIL FROM address (envelope sender)
+  string helo_domain = 3;  // EHLO identity (fallback if MAIL FROM is null)
+}
