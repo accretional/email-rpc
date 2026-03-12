@@ -1,0 +1,183 @@
+syntax = "proto3";
+package crypto;
+
+import "mime.proto";
+
+// ═══════════════════════════════════════════
+//  Shared types
+// ═══════════════════════════════════════════
+
+enum SignatureStatus {
+  VALID           = 0;  // signature verified, cert/key trusted
+  INVALID         = 1;  // signature verification failed (tampering or wrong key)
+  BAD_CERTIFICATE = 2;  // crypto ok but cert expired/revoked/untrusted
+  KEY_MISSING     = 3;  // signer's public key not available
+  ERROR           = 4;
+}
+
+message SignatureVerification {
+  SignatureStatus status     = 1;
+  string          signer     = 2;  // email address or key ID
+  string          fingerprint = 3;  // key/cert fingerprint
+  string          reason     = 4;
+  bool            trusted    = 5;  // is the key/cert in a trusted chain?
+}
+
+// ═══════════════════════════════════════════
+//  S/MIME (RFC 5751)
+// ═══════════════════════════════════════════
+//
+//  Uses X.509 certificates (same PKI as HTTPS).
+//  Content types:
+//    - application/pkcs7-mime; smime-type=enveloped-data  (encrypted)
+//    - application/pkcs7-mime; smime-type=signed-data     (opaque signature)
+//    - multipart/signed + application/pkcs7-signature     (clear signature)
+
+message SmimeCertificate {
+  bytes  der          = 1;  // DER-encoded X.509 certificate
+  string email        = 2;  // from Subject Alternative Name
+  string subject_dn   = 3;  // subject distinguished name
+  string issuer_dn    = 4;
+  string serial       = 5;
+  string fingerprint  = 6;  // SHA-256 of DER
+  int64  not_before   = 7;  // unix epoch
+  int64  not_after    = 8;
+}
+
+// ═══════════════════════════════════════════
+//  PGP/MIME (RFC 3156)
+// ═══════════════════════════════════════════
+//
+//  Uses OpenPGP web-of-trust model (no central CA).
+//  Content types:
+//    - multipart/encrypted; protocol="application/pgp-encrypted"
+//    - multipart/signed; protocol="application/pgp-signature"
+
+message PgpKey {
+  bytes  public_key   = 1;  // OpenPGP transferable public key
+  string key_id       = 2;  // short key ID
+  string fingerprint  = 3;  // full fingerprint
+  repeated string uids = 4; // user IDs: "Alice <alice@example.com>"
+  string algorithm    = 5;  // RSA, Ed25519, Cv25519, etc.
+  int64  created      = 6;
+  int64  expires      = 7;  // 0 = no expiry
+}
+
+// ═══════════════════════════════════════════
+//  Operations
+// ═══════════════════════════════════════════
+
+message EncryptResult {
+  bytes             encrypted_message = 1;  // complete RFC 5322 with encrypted MIME
+  mime.Entity       structure         = 2;  // the MIME tree (for debugging)
+}
+
+message DecryptResult {
+  bytes             decrypted_message = 1;  // the plaintext RFC 5322 message
+  bool              was_encrypted     = 2;
+  bool              was_signed        = 3;
+  SignatureVerification signature     = 4;  // populated if signed
+}
+
+message SignResult {
+  bytes             signed_message = 1;
+  mime.Entity       structure      = 2;
+}
+
+message VerifyResult {
+  SignatureVerification signature = 1;
+  bytes               content    = 2;  // the signed content
+}
+
+// ═══════════════════════════════════════════
+//  Service — unified interface for both schemes
+// ═══════════════════════════════════════════
+
+service CryptoService {
+  // ── Encrypt ──
+  rpc SmimeEncrypt(SmimeEncryptRequest) returns (EncryptResult);
+  rpc PgpEncrypt(PgpEncryptRequest) returns (EncryptResult);
+
+  // ── Decrypt ──
+  rpc SmimeDecrypt(SmimeDecryptRequest) returns (DecryptResult);
+  rpc PgpDecrypt(PgpDecryptRequest) returns (DecryptResult);
+
+  // ── Sign ──
+  rpc SmimeSign(SmimeSignRequest) returns (SignResult);
+  rpc PgpSign(PgpSignRequest) returns (SignResult);
+
+  // ── Verify ──
+  rpc SmimeVerify(SmimeVerifyRequest) returns (VerifyResult);
+  rpc PgpVerify(PgpVerifyRequest) returns (VerifyResult);
+
+  // ── Key/cert discovery ──
+  rpc LookupSmimeCert(CertLookupRequest) returns (CertLookupResponse);
+  rpc LookupPgpKey(KeyLookupRequest) returns (KeyLookupResponse);
+}
+
+// ── S/MIME requests ──
+message SmimeEncryptRequest {
+  bytes                      message     = 1;
+  repeated SmimeCertificate  recipients  = 2;
+  bool                       sign_also   = 3;
+  bytes                      signer_key  = 4;  // PKCS#8 private key
+  SmimeCertificate           signer_cert = 5;
+}
+
+message SmimeDecryptRequest {
+  bytes             message     = 1;
+  bytes             private_key = 2;
+  SmimeCertificate  certificate = 3;
+}
+
+message SmimeSignRequest {
+  bytes             message = 1;
+  bytes             private_key = 2;
+  SmimeCertificate  certificate = 3;
+  bool              opaque = 4;  // true = application/pkcs7-mime, false = multipart/signed
+}
+
+message SmimeVerifyRequest {
+  bytes message = 1;
+  // trusted CA certs for chain validation (if not using system trust store)
+  repeated bytes trusted_certs = 2;
+}
+
+// ── PGP requests ──
+message PgpEncryptRequest {
+  bytes            message    = 1;
+  repeated PgpKey  recipients = 2;
+  bool             sign_also  = 3;
+  bytes            signer_private_key = 4;
+}
+
+message PgpDecryptRequest {
+  bytes message     = 1;
+  bytes private_key = 2;
+}
+
+message PgpSignRequest {
+  bytes message     = 1;
+  bytes private_key = 2;
+  bool  cleartext   = 3;  // clearsign (human-readable) vs detached
+}
+
+message PgpVerifyRequest {
+  bytes message = 1;
+}
+
+// ── Key/cert discovery ──
+
+// S/MIME cert discovery via LDAP, DNS CERT/SMIMEA, or HTTPS
+message CertLookupRequest  { string email = 1; }
+message CertLookupResponse {
+  repeated SmimeCertificate certificates = 1;
+  string                    source       = 2;  // "ldap", "dns-smimea", "https"
+}
+
+// PGP key discovery via WKD (Web Key Directory), DNS, or keyservers
+message KeyLookupRequest  { string email = 1; }
+message KeyLookupResponse {
+  repeated PgpKey keys   = 1;
+  string          source = 2;  // "wkd", "dns", "keyserver"
+}
