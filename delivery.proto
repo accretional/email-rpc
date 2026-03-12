@@ -3,47 +3,67 @@ package delivery;
 
 import "mail.proto";
 import "smtp.proto";
+import "submission.proto";
 import "dns/mx.proto";
 import "dns/spf.proto";
 import "dns/dkim.proto";
 import "dns/dmarc.proto";
+import "dns/arc.proto";
+import "dns/tls_policy.proto";
+import "dns/bimi.proto";
+import "reputation.proto";
+import "bounce.proto";
 
 // ═══════════════════════════════════════════
-//  Outbound pipeline result
+//  Complete outbound pipeline
 // ═══════════════════════════════════════════
 //
 //  mail.Message
-//    → MimeCodec.Encode      (message → bytes)
-//    → DkimService.Sign      (attach signature)
-//    → MxResolver.Resolve    (find destination server, per recipient domain)
-//    → SmtpService.Deliver   (transmit)
+//    → SubmissionService.Submit       (auth sender, fixup headers)
+//    → MimeCodec.Encode               (message → RFC 5322 bytes)
+//    → ListService.GenerateHeaders     (add List-* headers if bulk)
+//    → DkimService.Sign                (attach DKIM signature)
+//    → ReputationService.CheckSuppression (skip suppressed recipients)
+//    per recipient domain:
+//      → MxResolver.Resolve            (find mail server)
+//      → TlsPolicyService.Resolve      (determine TLS requirements)
+//      → SmtpService.Deliver           (transmit with appropriate TLS)
+//    → BounceService.Process           (handle any failures)
 
 message OutboundDelivery {
   string                           recipient_domain = 1;
   dns.mx.ResolvedRoute             route            = 2;
-  repeated smtp.TransactionResult  results          = 3;
-  smtp.Session                     session          = 4;
+  dns.tls_policy.ResolvedTlsPolicy tls_policy       = 3;
+  repeated smtp.TransactionResult  results          = 4;
+  smtp.Session                     session          = 5;
+  submission.HeaderFixup           fixups           = 6;
 }
 
 // ═══════════════════════════════════════════
-//  Inbound authentication result
+//  Complete inbound authentication pipeline
 // ═══════════════════════════════════════════
 //
 //  raw message + connection metadata
-//    → SpfService.Check       (is this IP authorized?)
-//    → DkimService.Verify     (was this message tampered with?)
-//    → DmarcService.Evaluate  (do SPF/DKIM align with From: header? what's the policy?)
+//    → SpfService.Check                (is this IP authorized?)
+//    → DkimService.Verify              (was this message tampered with?)
+//    → ArcService.Validate             (is the forwarding chain intact?)
+//    → DmarcService.Evaluate           (do SPF/DKIM align with From:?)
+//    → BimiService.Evaluate            (does the sender have a verified logo?)
+//    → SieveService: execute active script
+//    → MimeCodec.Decode                (bytes → mail.Message)
+//    → CryptoService: decrypt if S/MIME or PGP/MIME
 
 message InboundAuthResult {
   dns.spf.CheckResult              spf   = 1;
   repeated dns.dkim.VerifyResult   dkim  = 2;
-  dns.dmarc.EvaluationResult       dmarc = 3;
+  dns.arc.ChainValidationResult    arc   = 3;
+  dns.dmarc.EvaluationResult       dmarc = 4;
+  dns.bimi.BimiResult              bimi  = 5;
 
-  // The Authentication-Results header to stamp on the message
-  // (RFC 8601 — this is how results are communicated to downstream MUAs)
-  string authentication_results_header = 4;
+  // RFC 8601: the Authentication-Results header to stamp
+  string authentication_results_header = 6;
 
-  Disposition disposition = 5;
+  Disposition disposition = 7;
   enum Disposition {
     ACCEPT     = 0;
     QUARANTINE = 1;
@@ -56,32 +76,33 @@ message InboundAuthResult {
 // ═══════════════════════════════════════════
 
 service DeliveryService {
-  // Outbound: full pipeline from mail.Message to remote delivery
   rpc Send(OutboundRequest) returns (OutboundResponse);
-
-  // Inbound: authenticate a received message
   rpc Authenticate(InboundRequest) returns (InboundAuthResult);
 }
 
 message OutboundRequest {
   mail.Message message = 1;
 
-  // DKIM signing configuration
-  string signing_domain  = 2;
-  string dkim_selector   = 3;
+  // Signing
+  string signing_domain   = 2;
+  string dkim_selector    = 3;
   bytes  dkim_private_key = 4;
 
+  // Delivery options
   smtp.DeliveryOptions options = 5;
+
+  // List headers (if this is a bulk/list send)
+  list.ListHeaders list_headers = 6;
 }
 
 message OutboundResponse {
-  // Results grouped by destination domain (each may have different MX)
   repeated OutboundDelivery deliveries = 1;
+  repeated string           suppressed = 2;  // addresses skipped due to suppression
 }
 
 message InboundRequest {
-  bytes  raw_message   = 1;  // received RFC 5322 message
-  string source_ip     = 2;  // connecting client IP
-  string helo_domain   = 3;  // EHLO identity
-  string envelope_from = 4;  // MAIL FROM
+  bytes  raw_message   = 1;
+  string source_ip     = 2;
+  string helo_domain   = 3;
+  string envelope_from = 4;
 }
