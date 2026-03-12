@@ -8,13 +8,18 @@ Also it seems like it would be cool to have the robots email each other? Or to b
 ```
 mail.proto                  ← user-facing model (what you send/receive)
 mime.proto                  ← wire format codec (message ↔ bytes)
-smtp.proto                  ← transport (envelope + delivery)
-submission.proto            ← MSA: client → mail system boundary
+smtp.proto                  ← transport (envelope + relay delivery)
+submission.proto            ← MSA: client → mail system trust boundary
+lmtp.proto                  ← final hop: MTA → message store
+queue.proto                 ← MTA queue lifecycle & retry policy
 imap.proto                  ← stateful retrieval
 pop.proto                   ← simple retrieval
 jmap.proto                  ← modern retrieval/sync
 sieve.proto                 ← server-side filtering
-delivery.proto              ← orchestration (ties everything together)
+milter.proto                ← MTA filter plugin protocol
+scanning.proto              ← content analysis (spam/phish/malware)
+trace.proto                 ← message path & received headers
+delivery.proto              ← orchestration (full inbound + outbound pipeline)
 
 dns/
   mx.proto                  ← mail server discovery
@@ -25,7 +30,10 @@ dns/
   tls_policy.proto          ← transport security (MTA-STS + DANE)
   autoconfig.proto          ← client service discovery
   bimi.proto                ← brand indicators
+  dnsbl.proto               ← DNS blocklists
 
+srs.proto                   ← sender rewriting (forwarding + SPF compat)
+eai.proto                   ← internationalized addresses (UTF-8, IDNA)
 list.proto                  ← mailing list headers + unsubscribe
 mdn.proto                   ← read receipts / disposition notifications
 crypto.proto                ← end-to-end encryption (S/MIME + PGP)
