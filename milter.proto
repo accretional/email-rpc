@@ -1,0 +1,128 @@
+syntax = "proto3";
+package milter;
+
+// ═══════════════════════════════════════════
+//  Milter lifecycle
+// ═══════════════════════════════════════════
+//
+//  The MTA calls the milter at each SMTP stage:
+//    connect → helo → mail_from → rcpt_to (×N) → headers (×N) → eoh → body (×N) → eom
+//
+//  At each stage the milter returns an action:
+//    CONTINUE  — proceed to next stage
+//    ACCEPT    — accept message, skip remaining milter calls
+//    REJECT    — reject with 5xx
+//    TEMPFAIL  — reject with 4xx
+//    DISCARD   — silently accept and drop (no delivery, no bounce)
+//    SKIP      — skip to next stage (milter protocol v6)
+//
+//  At end-of-message, the milter can also MODIFY:
+//    add/delete/change headers, replace body, add recipients, quarantine
+
+// ═══════════════════════════════════════════
+//  Negotiation
+// ═══════════════════════════════════════════
+//
+//  At connection time, MTA and milter negotiate:
+//    - which stages the milter wants to receive
+//    - which modification actions the milter wants to perform
+//  This lets the MTA skip callbacks the milter doesn't need.
+
+message NegotiateRequest {
+  uint32 version = 1;  // milter protocol version (6)
+  MilterFlags actions = 2;  // what modifications the milter WANTS to do
+  ProtocolFlags protocol = 3;  // what callbacks the milter DOESN'T want
+}
+
+message NegotiateResponse {
+  uint32 version = 1;
+  MilterFlags actions = 2;  // what the MTA ALLOWS the milter to do
+  ProtocolFlags protocol = 3;  // what callbacks will be skipped
+}
+
+message MilterFlags {
+  bool can_add_headers    = 1;
+  bool can_change_body    = 2;
+  bool can_add_recipients = 3;
+  bool can_delete_recipients = 4;
+  bool can_change_headers = 5;
+  bool can_quarantine     = 6;
+  bool can_change_from    = 7;
+  bool can_add_recipients_with_esmtp = 8;
+  bool can_set_symboliclist = 9;
+}
+
+message ProtocolFlags {
+  bool skip_connect    = 1;   // don't call on_connect
+  bool skip_helo       = 2;
+  bool skip_mail_from  = 3;
+  bool skip_rcpt_to    = 4;
+  bool skip_body       = 5;
+  bool skip_headers    = 6;
+  bool skip_eoh        = 7;   // skip end-of-headers callback
+  bool skip_unknown    = 8;   // skip unknown SMTP commands
+  bool skip_data       = 9;   // skip DATA command notification
+  bool no_reply_connect = 10; // milter won't reply to connect (async)
+  bool no_reply_helo    = 11;
+  bool no_reply_mail    = 12;
+  bool no_reply_rcpt    = 13;
+  bool no_reply_data    = 14;
+  bool no_reply_header  = 15;
+  bool no_reply_eoh     = 16;
+  bool no_reply_body    = 17;
+  bool no_reply_unknown = 18;
+}
+
+// ═══════════════════════════════════════════
+//  SMTP stage callbacks — MTA → milter
+// ═══════════════════════════════════════════
+
+message MilterEvent {
+  oneof event {
+    ConnectEvent   connect   = 1;
+    HeloEvent      helo      = 2;
+    MailFromEvent  mail_from = 3;
+    RcptToEvent    rcpt_to   = 4;
+    HeaderEvent    header    = 5;
+    EndOfHeaders   eoh       = 6;
+    BodyChunk      body      = 7;
+    EndOfMessage   eom       = 8;
+    AbortEvent     abort     = 9;
+    QuitEvent      quit      = 10;
+    DataEvent      data      = 11;
+    UnknownCommand unknown   = 12;
+  }
+}
+
+message ConnectEvent {
+  string hostname   = 1;
+  string address    = 2;  // IP address
+  uint32 port       = 3;
+  Family family     = 4;
+
+  enum Family {
+    UNKNOWN = 0;
+    UNIX    = 1;
+    INET    = 2;
+    INET6   = 3;
+  }
+}
+
+message HeloEvent      { string value = 1; }
+message MailFromEvent  { string address = 1; repeated string esmtp_args = 2; }
+message RcptToEvent    { string address = 1; repeated string esmtp_args = 2; }
+message HeaderEvent    { string name = 1; string value = 2; }
+message EndOfHeaders   {}
+message BodyChunk      { bytes data = 1; }
+message EndOfMessage   {}
+message AbortEvent     {}  // transaction aborted (RSET or connection drop)
+message QuitEvent      {}
+message DataEvent      {}
+message UnknownCommand { string command = 1; }
+
+// ═══════════════════════════════════════════
+//  Milter responses — milter → MTA
+// ═══════════════════════════════════════════
+
+message MilterAction {
+  oneof action {
