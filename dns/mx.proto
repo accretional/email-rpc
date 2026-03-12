@@ -1,0 +1,41 @@
+syntax = "proto3";
+package dns.mx;
+
+// ═══════════════════════════════════════════
+//  MX resolution
+// ═══════════════════════════════════════════
+
+message MxRecord {
+  uint32 preference = 1;  // lower = higher priority
+  string exchange   = 2;  // mail server hostname
+}
+
+// RFC 7505: explicit declaration that a domain does NOT accept mail
+message NullMx {
+  bool is_null = 1;  // preference=0, exchange="." → no mail here
+}
+
+message ResolvedRoute {
+  string             domain         = 1;
+  repeated MxRecord  records        = 2;  // sorted by preference
+  NullMx             null_mx        = 3;
+  repeated string    ipv4_addresses = 4;  // A records for chosen exchange
+  repeated string    ipv6_addresses = 5;  // AAAA records for chosen exchange
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+// Implements the RFC 5321 §5 algorithm:
+//  1. Query MX records for domain
+//  2. If none, fall back to A/AAAA on the domain itself
+//  3. Sort by preference, resolve chosen host to IPs
+//  4. Check for null MX (domain explicitly refuses mail)
+service MxResolver {
+  rpc Resolve(ResolveRequest) returns (ResolvedRoute);
+}
+
+message ResolveRequest {
+  string domain = 1;  // recipient's domain (right side of @)
+}
