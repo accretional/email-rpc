@@ -1,0 +1,183 @@
+syntax = "proto3";
+package dns.tls_policy;
+
+// ═══════════════════════════════════════════
+//  MTA-STS (RFC 8461)
+// ═══════════════════════════════════════════
+//
+//  Two-part mechanism:
+//  1. DNS TXT at _mta-sts.<domain> declares the policy exists and its version
+//  2. HTTPS fetch at https://mta-sts.<domain>/.well-known/mta-sts.txt gets the policy
+//
+//  The HTTPS fetch is the trust anchor — it leverages the WebPKI.
+//  This means MTA-STS doesn't require DNSSEC (unlike DANE).
+
+message MtaStsRecord {
+  string version = 1;  // "STSv1"
+  string id      = 2;  // policy ID — change this to signal a policy update
+}
+
+message MtaStsPolicy {
+  string          version  = 1;  // "STSv1"
+  Mode            mode     = 2;
+  repeated string mx       = 3;  // allowed MX hostnames (may use wildcards: *.example.com)
+  uint32          max_age  = 4;  // policy cache duration in seconds
+
+  enum Mode {
+    NONE    = 0;  // no policy — effectively opt-out
+    TESTING = 1;  // evaluate but don't enforce (report failures via TLSRPT)
+    ENFORCE = 2;  // reject delivery if TLS requirements aren't met
+  }
+}
+
+// ═══════════════════════════════════════════
+//  DANE (RFC 7672 + RFC 6698)
+// ═══════════════════════════════════════════
+//
+//  TLSA records published in DNS, authenticated via DNSSEC.
+//  Binds a certificate (or public key, or CA) to a specific port/protocol.
+//  Stronger than MTA-STS (no HTTPS dependency) but requires DNSSEC deployment.
+
+message TlsaRecord {
+  // _<port>._tcp.<hostname> IN TLSA <usage> <selector> <matching_type> <data>
+  CertificateUsage  usage         = 1;
+  Selector          selector      = 2;
+  MatchingType      matching_type = 3;
+  bytes             certificate_data = 4;  // the hash or full cert, per matching_type
+
+  enum CertificateUsage {
+    CA_CONSTRAINT       = 0;  // PKIX-TA: must chain to this CA
+    SERVICE_CERTIFICATE = 1;  // PKIX-EE: must be this exact cert (and pass PKIX)
+    TRUST_ANCHOR        = 2;  // DANE-TA: must chain to this, PKIX not required
+    DOMAIN_ISSUED       = 3;  // DANE-EE: must be this exact cert, no PKIX needed
+  }
+
+  enum Selector {
+    FULL_CERTIFICATE = 0;  // match against entire cert (DER)
+    SUBJECT_PUBLIC_KEY = 1;  // match against SubjectPublicKeyInfo only
+  }
+
+  enum MatchingType {
+    EXACT  = 0;  // no hashing — compare raw bytes
+    SHA256 = 1;
+    SHA512 = 2;
+  }
+}
+
+// ═══════════════════════════════════════════
+//  TLSRPT (RFC 8460) — TLS failure reporting
+// ═══════════════════════════════════════════
+//
+//  Published as _smtp._tls.<domain> TXT record.
+//  Tells senders where to report TLS negotiation failures.
+//  Complements both MTA-STS and DANE.
+
+message TlsRptRecord {
+  string          version = 1;  // "TLSRPTv1"
+  repeated string rua     = 2;  // report destinations: "mailto:..." or "https://..."
+}
+
+message TlsReport {
+  string                       organization   = 1;
+  string                       contact_info   = 2;
+  string                       report_id      = 3;
+  DateRange                    date_range     = 4;
+  repeated TlsPolicyResult     policies       = 5;
+}
+
+message DateRange {
+  string start = 1;  // ISO 8601
+  string end   = 2;
+}
+
+message TlsPolicyResult {
+  PolicyType            policy_type = 1;
+  repeated string       policy_string = 2;  // the MX list (MTA-STS) or TLSA records
+  string                domain      = 3;
+  repeated string       mx_host     = 4;
+  Summary               summary     = 5;
+  repeated FailureDetail failures   = 6;
+
+  enum PolicyType {
+    TLSA    = 0;  // DANE
+    STS     = 1;  // MTA-STS
+    NO_POLICY = 2;
+  }
+}
+
+message Summary {
+  uint64 total_successful = 1;
+  uint64 total_failure    = 2;
+}
+
+message FailureDetail {
+  ResultType result_type          = 1;
+  string     sending_mta_ip      = 2;
+  string     receiving_mx_hostname = 3;
+  string     receiving_ip        = 4;
+  uint64     failed_session_count = 5;
+  string     additional_info     = 6;
+  string     failure_reason_code = 7;
+
+  enum ResultType {
+    STARTTLS_NOT_SUPPORTED   = 0;
+    CERTIFICATE_HOST_MISMATCH = 1;
+    CERTIFICATE_EXPIRED      = 2;
+    CERTIFICATE_NOT_TRUSTED  = 3;
+    VALIDATION_FAILURE       = 4;
+    TLSA_INVALID             = 5;
+    DNSSEC_INVALID           = 6;
+    STS_POLICY_FETCH_ERROR   = 7;
+    STS_POLICY_INVALID       = 8;
+    STS_WEBPKI_INVALID       = 9;
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Unified policy resolution
+// ═══════════════════════════════════════════
+//
+//  In practice, a sender checks both:
+//    1. DANE (if DNSSEC is available for the MX hostname)
+//    2. MTA-STS (always checkable via HTTPS)
+//  DANE takes precedence when DNSSEC-validated TLSA records exist.
+
+message ResolvedTlsPolicy {
+  string              domain     = 1;
+  MtaStsPolicy        mta_sts    = 2;  // null if no policy published
+  repeated TlsaRecord dane       = 3;  // empty if no TLSA records or no DNSSEC
+  bool                dnssec     = 4;  // whether the zone is DNSSEC-signed
+  EffectivePolicy     effective  = 5;
+
+  enum EffectivePolicy {
+    OPPORTUNISTIC    = 0;  // no policy found, TLS best-effort
+    MTA_STS_TESTING  = 1;  // MTA-STS in testing mode
+    MTA_STS_ENFORCE  = 2;  // MTA-STS enforcing
+    DANE_VALIDATED   = 3;  // DNSSEC + TLSA verified
+  }
+}
+
+// ═══════════════════════════════════════════
+//  Service
+// ═══════════════════════════════════════════
+
+service TlsPolicyService {
+  // Look up MTA-STS policy (DNS TXT + HTTPS fetch)
+  rpc LookupMtaSts(MtaStsLookupRequest) returns (MtaStsPolicy);
+
+  // Look up DANE/TLSA records for an MX hostname
+  rpc LookupDane(DaneLookupRequest) returns (DaneLookupResponse);
+
+  // Resolve the effective TLS policy for a recipient domain
+  // (checks both MTA-STS and DANE, returns the stronger)
+  rpc Resolve(TlsPolicyResolveRequest) returns (ResolvedTlsPolicy);
+
+  // Submit a TLS failure report
+  rpc Report(TlsReport) returns (ReportResponse);
+}
+
+message MtaStsLookupRequest       { string domain = 1; }
+message DaneLookupRequest         { string hostname = 1; uint32 port = 2; }
+message DaneLookupResponse        { repeated TlsaRecord records = 1; bool dnssec_valid = 2; }
+message TlsPolicyResolveRequest   { string domain = 1; }
+message ReportResponse            { bool accepted = 1; }
